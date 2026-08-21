@@ -1,0 +1,7 @@
+name = "pointword-api"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# Secrets are NOT stored here. Set them with:
+#   wrangler secret put DASHSCOPE_API_KEY
+#   wrangler secret put APP_SHARED_SECRET   (optional)

@@ -1,0 +1,9 @@
+{
+  "name": "pointword-api",
+  "version": "1.0.0",
+  "description": "PointWord DashScope proxy for Aliyun FC Web function",
+  "main": "fc-index.js",
+  "scripts": {
+    "start": "node fc-index.js"
+  }
+}
