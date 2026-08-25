@@ -45,6 +45,18 @@ struct CameraView: View {
     // Library sheet, opened from the top-right badge.
     @State private var showLibrary = false
 
+    // Onboarding-hint lifecycle. Shown once on the first cold launch, capped at
+    // hintVisibleDuration, and hidden the instant a card appears. Not re-shown on
+    // resume, library return, or card close. hintSession guards the fade timer so
+    // a late/superseded timer no-ops itself.
+    @State private var hintVisible = false
+    @State private var hintSession = UUID()
+    // Set when the hint was requested before the preview had pixels (cold launch).
+    // Once the first frame arrives we start it for real.
+    @State private var hintPendingPreview = false
+
+    private let hintVisibleDuration: TimeInterval = 5.0   // max time the onboarding hint stays up
+
     // At most 5 cards on screen (1 primary + 4 secondary).
     private let maxCards = 5
 
@@ -52,6 +64,9 @@ struct CameraView: View {
         ZStack {
             cameraLayer
             annotationLayer
+
+            // Recognition sweep — above the live page, below any result card.
+            scanLineView
 
             // Card overlay
             if showOverlay {
@@ -61,6 +76,14 @@ struct CameraView: View {
             heartFlashView
             scanningHintView
             idlePointHintView
+
+            // Camera feed stalled (system interruption / resource reclaim) — surface
+            // a visible, tappable recover instead of a silently dead screen. Sits
+            // above everything but the permission fallback. Auto-clears the instant
+            // frames resume (isStalled flips false in CameraManager).
+            if camera.isStalled && !camera.permissionDenied {
+                cameraStalledView
+            }
 
             // Camera permission denied — full-screen fallback with a route to Settings.
             if camera.permissionDenied {
@@ -75,15 +98,35 @@ struct CameraView: View {
         .overlay { badge }
         .animation(.easeInOut(duration: 0.2), value: camera.isScanning)
         .animation(.easeInOut(duration: 0.2), value: showOverlay)
+        .animation(.easeInOut(duration: 0.35), value: hintVisible)
+        .animation(.easeInOut(duration: 0.25), value: camera.isStalled)
         .fullScreenCover(isPresented: $showLibrary) {
             LibraryView()
         }
         .onAppear {
             camera.requestPermissionAndStart()
+            startHintSession()
+            OfflineDictionary.shared.preload()   // warm the no-network fallback off the main thread
         }
         .onDisappear { camera.stop() }
+        .onChange(of: showLibrary) { open in
+            if open {
+                // Library covers us full-screen → SwiftUI fires onDisappear and we
+                // stop the session to free the camera. Nothing else runs while the
+                // library is up.
+            } else {
+                // Returned from the library. onAppear does NOT re-fire for a view
+                // revealed from under a fullScreenCover, so the session we stopped
+                // on cover-present would stay dead (preview frozen, no detection).
+                // Restart it explicitly. The onboarding hint is intentionally NOT
+                // shown here — it's a first-launch primer only.
+                camera.requestPermissionAndStart()
+            }
+        }
         .onChange(of: scenePhase) { phase in
-            // Re-check when coming back from Settings — they may have granted access.
+            // Re-check when coming back from Settings / the background — they may
+            // have granted access. The onboarding hint is NOT re-shown on resume;
+            // it appears only on a fresh cold launch (onAppear).
             if phase == .active {
                 camera.requestPermissionAndStart()
                 // The live session restarts on resume, but a stale freeze would
@@ -95,6 +138,7 @@ struct CameraView: View {
         .onChange(of: camera.pointedWord?.text) { _ in recompute() }
         .onChange(of: camera.colorMarks) { _ in recompute() }
         .onChange(of: camera.hoveringWord?.text) { _ in prefetchHovered() }
+        .onChange(of: camera.isPreviewLive) { live in if live { onPreviewLive() } }
     }
 
     // MARK: - Body layers
@@ -202,9 +246,14 @@ struct CameraView: View {
     }
 
     // Bottom scanning hint with shimmer — while a target is being confirmed.
+    // Yields to the entry guidance hint while it's up: they share the bottom
+    // slot, and on a reading app the page is full of text so isScanning goes
+    // true almost immediately — if scanning won, the guidance hint would never
+    // get its window. The guidance hint is brief (a couple seconds), so ceding
+    // to it costs nothing.
     @ViewBuilder
     private var scanningHintView: some View {
-        if camera.isScanning && !showOverlay {
+        if camera.isScanning && !showOverlay && !hintVisible {
             ScanningHint(text: language.scanning)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 44)
@@ -212,25 +261,36 @@ struct CameraView: View {
         }
     }
 
+    // Full-screen top→bottom sweep shown while recognizing, gone once a card is
+    // up. Same visibility gate as the scanning pill so the two appear together.
+    @ViewBuilder
+    private var scanLineView: some View {
+        if camera.isScanning && !showOverlay {
+            ScanLineView()
+        }
+    }
+
     // Idle guidance — the camera is live but nothing is pointed at / recognizing
     // and no card is up. Without this the screen reads as "dead" over a page it
-    // deliberately won't auto-translate. A calm static pill teaches the core
-    // gesture. Suppressed the moment scanning or a result takes over.
+    // deliberately won't auto-translate. Clean shadowed text teaches the core
+    // gestures. Suppressed the moment scanning or a result takes over.
     @ViewBuilder
     private var idlePointHintView: some View {
-        if !showOverlay && !camera.isScanning && !camera.permissionDenied {
+        if hintVisible && !showOverlay && !camera.permissionDenied {
             Text(language.pointHint)
-                .font(.subheadline.weight(.medium))
-                .foregroundColor(.white.opacity(0.95))
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                // Dark underlay UNDER the glass so the pill stays legibly dark over
-                // bright scenes. .ultraThinMaterial alone is adaptive and washes out
-                // to near-white over light backgrounds (paper / desk), hiding the
-                // light text. Mirrors glassPill's black-0.45 underlay.
-                .background(Color.black.opacity(0.45), in: Capsule())
-                .glassCapsule()
-                .environment(\.colorScheme, .dark)
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.white)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                // No pill — clean floating text per the 留白 look. White text
+                // washes out on bright paper, so two stacked shadows carry the
+                // contrast: a tight dark one draws a crisp edge right around the
+                // glyphs, a softer wider one lifts them off any background. Works
+                // over both the dark desk (top) and the white page (bottom).
+                .shadow(color: .black.opacity(0.55), radius: 1.5, x: 0, y: 0.5)
+                .shadow(color: .black.opacity(0.35), radius: 6, x: 0, y: 1)
+                .padding(.horizontal, 32)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 44)
                 .allowsHitTesting(false)
@@ -240,6 +300,43 @@ struct CameraView: View {
 
     private var showOverlay: Bool {
         !displayWords.isEmpty
+    }
+
+    // Frozen-feed recover affordance. When the watchdog reports the camera feed
+    // has stalled, the live preview is a dead still — nothing else on screen tells
+    // the user, and there's no way to force a recovery. This dims the frozen frame,
+    // says what happened, and offers a big tap target that fully rebuilds the
+    // session. It disappears on its own the moment frames resume.
+    @ViewBuilder
+    private var cameraStalledView: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 18) {
+                Image(systemName: "arrow.triangle.2.circlepath.camera")
+                    .font(.system(size: 46))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
+
+                Text(language.cameraStalledTitle)
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+
+                Button {
+                    camera.forceRecover()
+                } label: {
+                    Text(language.cameraStalledButton)
+                        .font(.body.weight(.semibold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 14)
+                        .glassProminentCapsule(tint: .white)
+                }
+            }
+            .padding(.horizontal, 40)
+        }
+        .transition(.opacity)
     }
 
     // MARK: - Result overlay
@@ -354,7 +451,53 @@ struct CameraView: View {
         focusedWord = nil
         isLocked = false
         hitBoxes = []
-        camera.unfreeze()   // drop the still, resume live preview
+        camera.unfreeze()       // drop the still, resume live preview
+        camera.resetDetection() // clear stale pointed word / marks so the next
+                                // card comes from a FRESH finger hold, not the
+                                // leftover result that just closed
+        // No hint here — the onboarding primer is shown only on first cold launch,
+        // not every time a card closes.
+    }
+
+    // MARK: - Onboarding hint scheduling
+    //
+    // A first-launch primer only: it appears once when the app cold-launches
+    // (onAppear), stays at most hintVisibleDuration seconds, and disappears the
+    // instant a scan result (card) shows. It is NOT re-shown on background resume,
+    // on returning from the library, or after a card closes. hintSession is bumped
+    // on the (single) start so a superseded/late timer no-ops itself.
+    private func startHintSession() {
+        // If the preview has no pixels yet (cold launch — the camera takes a beat
+        // to deliver its first frame), defer: showing the hint over the black
+        // startup gap wastes its whole window, which is exactly why it "didn't
+        // appear" after launch. onPreviewLive picks it up.
+        guard camera.isPreviewLive else {
+            hintPendingPreview = true
+            return
+        }
+        hintPendingPreview = false
+        let session = UUID()
+        hintSession = session
+        showHint(session)
+    }
+
+    // The first camera frame arrived. If a hint session was waiting on it, run it now.
+    private func onPreviewLive() {
+        guard hintPendingPreview else { return }
+        hintPendingPreview = false
+        startHintSession()
+    }
+
+    private func showHint(_ session: UUID) {
+        // A newer session superseded us, or a card is already up — do nothing.
+        guard session == hintSession, !showOverlay else { return }
+        hintVisible = true
+
+        // Hard cap: fade out after the max window even if the user never scans.
+        DispatchQueue.main.asyncAfter(deadline: .now() + hintVisibleDuration) {
+            guard session == hintSession else { return }
+            hintVisible = false
+        }
     }
 
     // Brief white heart burst at the top when a word is saved.
@@ -380,6 +523,7 @@ struct CameraView: View {
 
         // Lock onto this result and show it.
         isLocked = true
+        hintVisible = false                         // a result is up → drop the onboarding hint
         camera.freeze()                             // freeze the live preview into a still
         lockedSnapshot = camera.currentSnapshot()   // freeze the page for the library card
         displayWords = targets.map { $0.displayKey }
@@ -474,9 +618,18 @@ struct CameraView: View {
                 }
             } catch {
                 await MainActor.run {
-                    // Keep any partial we already showed; only fail if we have nothing.
+                    // Network/AI failed. Before showing a dead "retry" card, try the
+                    // bundled offline dictionary — the subway safety net. Only for
+                    // single words (a marked phrase is an AI whole-phrase
+                    // translation the offline word list can't reproduce), and only
+                    // if we haven't already streamed a partial answer in.
                     if case .loading = cardStates[key] ?? .loading(key) {
-                        cardStates[key] = .failed(key)
+                        if !unit.isPhrase,
+                           let offline = OfflineDictionary.shared.lookup(unit.term, language: lang) {
+                            cardStates[key] = .loaded(offline)
+                        } else {
+                            cardStates[key] = .failed(key)
+                        }
                     }
                 }
             }
@@ -586,6 +739,55 @@ struct CameraDeniedView: View {
                         .glassProminentCapsule(tint: .white)
                 }
                 .padding(.top, 8)
+            }
+        }
+    }
+}
+
+// A horizontal glow band that sweeps top→bottom on repeat while a target is
+// being recognized. Purely decorative feedback ("something is happening"); it
+// carries no layout and ignores touches. Shown while scanning, gone the instant
+// a card appears. Kept restrained — a thin white line with a soft falloff — so
+// it reads as a clean sweep over the page, not a gamer HUD.
+struct ScanLineView: View {
+    @State private var phase: CGFloat = 0
+
+    // Height of the soft glow tail. The band travels one full screen + this.
+    private let bandHeight: CGFloat = 80
+
+    var body: some View {
+        GeometryReader { geo in
+            let h = geo.size.height
+            // The moving band: a fine bright hairline riding a soft white gradient
+            // tail so it looks like light gliding down the page, not a hard rule.
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        .clear,
+                        Color.white.opacity(0.10),
+                        Color.white.opacity(0.55),
+                        .clear
+                    ],
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: bandHeight)
+                // Fine bright core line for a crisp leading edge.
+                Rectangle()
+                    .fill(Color.white.opacity(0.9))
+                    .frame(height: 0.75)
+                    .shadow(color: .white.opacity(0.5), radius: 3)
+            }
+            // Travel from just above the top edge to just past the bottom.
+            .offset(y: phase * (h + bandHeight) - bandHeight / 2)
+            .frame(width: geo.size.width)
+        }
+        .allowsHitTesting(false)
+        .ignoresSafeArea()
+        .transition(.opacity)
+        .onAppear {
+            phase = 0
+            withAnimation(.easeInOut(duration: 3.0).repeatForever(autoreverses: false)) {
+                phase = 1
             }
         }
     }

@@ -184,26 +184,9 @@ private struct WordAlbumCard: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .overlay(alignment: .bottomLeading) {
-                // Second-precision timestamp of when the word was saved.
-                Text(Self.stamp.string(from: item.createdAt))
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.85))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(.black.opacity(0.35), in: Capsule())
-                    .padding(6)
-            }
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .contentShape(RoundedRectangle(cornerRadius: 10))
     }
-
-    // Shared formatter — building DateFormatter per cell is wasteful in a grid.
-    private static let stamp: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm:ss"
-        return f
-    }()
 
     @ViewBuilder
     private var background: some View {
@@ -243,39 +226,53 @@ private struct WordDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                // The camera frame frozen at recognition, if we kept one.
+        // Mirror the camera result layout: the captured page fills the
+        // background and the word card floats over it, docked to the bottom —
+        // no scrolling. The image keeps its real aspect ratio (never cropped),
+        // so it letterboxes rather than filling edge to edge.
+        ZStack(alignment: .bottom) {
+            Group {
                 if let data = item.snapshot, let ui = UIImage(data: data) {
                     Image(uiImage: ui)
                         .resizable()
-                        .scaledToFill()
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 220)
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    LinearGradient(
+                        colors: [Color(white: 0.25), Color(white: 0.1)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing
+                    )
                 }
-
-                // Same card the recognition result used. Tapping the ♥ here
-                // un-saves the word — we then pop back to the library.
-                WordCardView(
-                    state: .loaded(explanation),
-                    language: language,
-                    onRemoved: { dismiss() }
-                )
-
-                // Full save time, to the second.
-                HStack(spacing: 6) {
-                    Image(systemName: "clock")
-                    Text(Self.stamp.string(from: item.createdAt))
-                        .font(.system(.subheadline, design: .monospaced))
-                }
-                .foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
+            .ignoresSafeArea()
+
+            // Floating bottom block: just the word card, docked to the bottom —
+            // same 20pt gutters as the camera page. The save time now lives in the
+            // nav bar as a subtitle, so nothing competes with the card down here.
+            WordCardView(
+                state: .loaded(explanation),
+                language: language,
+                onRemoved: { dismiss() }
+            )
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
-        .navigationTitle(item.word)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // Word as the title with the second-precision save time as a subtitle
+            // stacked beneath it — a quiet timestamp that never covers the card.
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(item.word)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    Text(Self.stamp.string(from: item.createdAt))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            }
+        }
     }
 
     private static let stamp: DateFormatter = {

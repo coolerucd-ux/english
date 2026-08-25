@@ -11,13 +11,18 @@ struct WordExplanation {
     let contextPhrase: String       // 单词所在的短语/句子，如 "delicate aroma"
     let contextMeaning: String      // 在这句话里的具体含义
 
+    // 该释义来自本地离线词典（AI 讲解在无网络时的兜底），而非在线 AI。
+    // 卡片据此显示"离线释义"标记，让用户知道这是基础含义、非语境讲解。
+    let isOffline: Bool
+
     init(
         word: String,
         phonetic: String,
         partOfSpeech: String,
         meanings: [String],
         contextPhrase: String = "",
-        contextMeaning: String = ""
+        contextMeaning: String = "",
+        isOffline: Bool = false
     ) {
         self.word = word
         self.phonetic = phonetic
@@ -25,5 +30,6 @@ struct WordExplanation {
         self.meanings = meanings
         self.contextPhrase = contextPhrase
         self.contextMeaning = contextMeaning
+        self.isOffline = isOffline
     }
 }

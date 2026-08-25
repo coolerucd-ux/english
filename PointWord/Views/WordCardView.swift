@@ -64,9 +64,22 @@ struct WordCardView: View {
 
     private var fullBody: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(displayTitle)
-                .font(.title2.bold())
-                .foregroundColor(.white)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(displayTitle)
+                    .font(.title2.bold())
+                    .foregroundColor(.white)
+
+                // Tag a no-network fallback result so the user knows this is a
+                // basic offline meaning, not the usual contextual AI explanation.
+                if case .loaded(let exp) = state, exp.isOffline {
+                    Text(language.offlineBadge)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(.white.opacity(0.75))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.14), in: Capsule())
+                }
+            }
 
             content
 
