@@ -1,302 +1,496 @@
 import AVFoundation
 import Vision
-import Combine
+import Observation
 import CoreGraphics
 import UIKit
 
-// Manages camera session and all Vision processing (OCR + hand pose + color marks).
-class CameraManager: NSObject, ObservableObject {
-    @Published var detectedWords: [DetectedWord] = []
-    @Published var fingerVisionPoint: CGPoint? = nil  // Vision space, bottom-left origin
-    @Published var pointedWord: DetectedWord? = nil
-    @Published var hoveringText: String? = nil        // word under finger before confirmed
-    @Published var hoveringWord: DetectedWord? = nil  // same, with context — used for AI prefetch
-    @Published var colorMarks: [ColorMark] = []       // stable detected marks on paper
-    @Published var isScanning: Bool = false           // a target is being confirmed → show bottom hint
-    @Published var permissionDenied: Bool = false     // camera access denied/restricted → show settings fallback
-    @Published var isPreviewLive: Bool = false        // first frame has arrived → the preview is actually showing pixels
-    @Published var isStalled: Bool = false            // frames stalled while we intend to run → surface a recover affordance
+// Manages the camera session and all Vision processing (OCR + hand pose).
+//
+// Recognition is FINGER-ONLY: the user points at a word and holds. Underline /
+// circle ("color mark") detection was removed — on handheld, tilted paper it was
+// unreliable and its per-word luma scan was the main frame-rate sink.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// OBSERVATION MODEL — the freeze fix (part 1 of 2).
+//
+// This type is @Observable (Swift Observation, iOS 17+), NOT the old
+// ObservableObject / @Published. That single change is the core of the freeze
+// fix, and the reason must be spelled out:
+//
+//   Under ObservableObject, EVERY @Published mutation re-evaluates the WHOLE
+//   body of every observing view. The frame pipeline publishes ~10×/sec
+//   (finger point, probe, progress, hovering/pointed word …), so the entire
+//   CameraView.body was recomputing ~10×/sec — including layout it no longer
+//   even draws (detectedWords). Combined with a geometry read-back in that body,
+//   iOS 26's stricter dependency tracking saw an AttributeGraph CYCLE and wedged
+//   the whole SwiftUI graph. The hardware AVCaptureVideoPreviewLayer kept moving
+//   underneath, so the picture animated while the blue dot, hints, card AND the
+//   diagnostic HUD all went dead — the exact reported freeze.
+//
+//   @Observable tracks reads PER PROPERTY. A view re-evaluates only when a
+//   property it ACTUALLY reads changes. detectedWords (written, never read by the
+//   view) now triggers zero re-renders; the finger dot redraw touches only the dot.
+//   The 10×/sec full-body churn — the fuel the cycle fed on — is gone.
+//
+// Property annotations below:
+//   • plain `var`         → an OBSERVED output the view reads (dot, card, HUD…).
+//   • `@ObservationIgnored` → internal machinery the view never reads. Excluding
+//     it keeps the tracked surface minimal and avoids accidental invalidations.
+//
+// SESSION LIFECYCLE — the freeze fix (part 2 of 2).
+//
+// Everything that used to live here — a 1s frame watchdog, a dead-frame detector,
+// a cold-start "never got a frame" rebuild, exponential-backoff restarts, a
+// restart-flood lock, session teardown/rebuild — is GONE.
+//
+// Two findings drove this:
+//   1. The err=-17281 / FigCaptureSourceRemote spam is NOISE on iOS 26, not the
+//      freeze. Apple's own dev-forum threads show a clean, minimal
+//      AVCaptureVideoDataOutput setup emits the identical assertions on iOS 26.x
+//      but not on iOS 18 — "informational only". The old code treated the log as
+//      a fault and reacted by tearing the session down and rebuilding it, which is
+//      the single most reliable way to ACTUALLY wedge the shared camera server.
+//      We were curing a disease that our own restarts caused.
+//   2. The real freeze ("画面在动但没有蓝点/提示/卡片") was the AttributeGraph cycle
+//      described above, plus a main-thread `sessionQueue.sync` in the old stop().
+//
+// The model here is now the minimal, Apple-blessed one (canonical AVCam):
+//   • Configure the session ONCE and keep it for the app's lifetime.
+//   • startRunning() on foreground, stopRunning() on background.
+//   • All session mutations on a dedicated serial queue, always ASYNC — never a
+//     synchronous hop from the main thread.
+//   • React to exactly one runtime error, mediaServicesWereReset, by
+//     re-arming the session. Everything else is left to the system.
+// No self-inflicted churn, so nothing hammers mediaserverd.
+// ─────────────────────────────────────────────────────────────────────────────
+@Observable
+final class CameraManager: NSObject {
+    var detectedWords: [DetectedWord] = []
+    var fingerVisionPoint: CGPoint? = nil  // Vision space, bottom-left origin
+    // The point the app actually READS — the fingertip projected forward along the
+    // finger's own direction (nail → just past it), i.e. the spot ABOVE the nail
+    // where OCR sampling happens. The blue locking ring is drawn HERE, not at the
+    // raw fingertip, so what the user sees the ring sit on is exactly the word being
+    // recognized.
+    var fingerProbePoint: CGPoint? = nil   // Vision space; the read/lock position
+    var pointedWord: DetectedWord? = nil
+    var hoveringText: String? = nil        // word under finger before confirmed
+    var hoveringWord: DetectedWord? = nil  // same, with context — used for AI prefetch
+    // 0…1 fill of the fingertip "locking" ring. Grows only while the finger is truly
+    // stopped on one spot; snaps to 0 the instant it moves.
+    var pointingProgress: Double = 0
+    var isScanning: Bool = false           // a target is being confirmed → show bottom hint
+    var permissionDenied: Bool = false     // camera access denied/restricted → show settings fallback
+    var isPreviewLive: Bool = false        // first frame has arrived → preview is actually showing pixels
+
+    // Live diagnostic readout, mirrored from the frame-flow heartbeat (~1s). Shown
+    // as a tiny corner HUD when showDiagnostics is on, so a screenshot of a frozen
+    // state is self-diagnosing. Empty until the first heartbeat.
+    var diagLine: String = ""
 
     // A crisp still of the frame at lock time. Displayed over the live preview so
-    // the result "freezes" — green boxes then sit on fixed pixels and never drift
-    // with subsequent OCR/hand movement. Cleared on rescan.
-    @Published var frozenImage: UIImage? = nil
-    private var freezeRequested = false               // processing-queue only
+    // the result "freezes". Cleared on rescan.
+    var frozenImage: UIImage? = nil
+    @ObservationIgnored private var freezeRequested = false   // processing-queue only
+    // MAIN-THREAD authority for "a frozen still should currently be showing".
+    // freeze()/unfreeze() set this SYNCHRONOUSLY on the main thread; the
+    // still-application block in captureOutput (which also hops to main) checks it
+    // before assigning frozenImage. This closes a race that left a stuck frozen
+    // frame over the live preview: freeze() only REQUESTS a still (rendered a few
+    // frames later), while the old unfreeze() cleared frozenImage only if it was
+    // already set AND never cancelled a pending request — so a freeze requested
+    // just before 重新识别 landed AFTER unfreeze ran, with nothing left to clear it.
+    // That looked like "camera won't start" (card gone, scan light back, blurred
+    // still on top). With this flag, a still is applied only while it's intended.
+    @ObservationIgnored private var freezeIntended = false    // main-thread only
 
-    let session = AVCaptureSession()
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let processingQueue = DispatchQueue(label: "pw.vision", qos: .userInitiated)
-    private let colorMarkService = ColorMarkService()
+    @ObservationIgnored let session = AVCaptureSession()
+    @ObservationIgnored private let videoOutput = AVCaptureVideoDataOutput()
 
-    private lazy var ocrRequest: VNRecognizeTextRequest = {
+    // Weak ref to the on-screen preview layer, set by CameraPreviewView once it's
+    // built. Used ONLY to convert a Vision point → device focus point via Apple's own
+    // captureDevicePointConverted(fromLayerPoint:), which bakes in videoGravity +
+    // rotation for us — so we never hand-roll the orientation transform. weak: the
+    // view owns the layer; we just borrow it while it's alive.
+    @ObservationIgnored weak var previewLayer: AVCaptureVideoPreviewLayer?
+
+    // Autofocus-aim throttle (main-thread only). We steer continuous AF at the word
+    // the finger points at (refocus(onVisionPoint:)). Refocusing every frame makes AF
+    // "pump", so we only re-aim when the target moved meaningfully AND enough time has
+    // passed since the last aim. lastFocusPoint is in DEVICE POI space ([0,1]).
+    @ObservationIgnored private var lastFocusPoint: CGPoint? = nil
+    @ObservationIgnored private var lastFocusAt: Date = .distantPast
+    private let focusMoveThreshold: CGFloat = 0.06   // device-space move that warrants a re-aim
+    private let focusMinInterval: TimeInterval = 0.8 // min seconds between re-aims (anti-pump)
+    // Mirrors CameraView.imageSize: hd1280x720 captured landscape, treated as portrait
+    // 720×1280 by VNImageRequestHandler(orientation: .right). Kept in sync with the
+    // view's constant so the Vision→layer mapping here matches the green dot exactly.
+    @ObservationIgnored private let focusImageSize = CGSize(width: 720, height: 1280)
+    // TWO queues, deliberately separate (canonical AVCam design):
+    //  • processingQueue — the video-output DELEGATE queue. Every frame's heavy
+    //    Vision work (OCR + hand pose) runs here.
+    //  • sessionQueue — session LIFECYCLE only (configure / start / stop). Session
+    //    control calls block synchronously and can take a while when the system is
+    //    under pressure; keeping them off the frame queue (and off main) means they
+    //    never wedge frame delivery or the UI.
+    // Everything below is INTERNAL machinery — mutated on the processing/session
+    // queues and never read by any view. Under @Observable a stored `var` is tracked
+    // by default; @ObservationIgnored keeps these OFF the tracked surface (no
+    // accidental invalidations, and no cross-thread Observation registrar access
+    // from the frame queue). `let` constants never mutate, so they need no annotation.
+    @ObservationIgnored private let processingQueue = DispatchQueue(label: "pw.vision", qos: .userInitiated)
+    @ObservationIgnored private let sessionQueue = DispatchQueue(label: "pw.session")
+
+    // OCR is restricted to this band of the frame (normalized, bottom-left origin):
+    // full width × middle 60% height. The user always points near center, so
+    // recognizing edge-to-edge just burned frames. CRITICAL: Vision reports each
+    // observation's boundingBox RELATIVE TO THIS ROI, not the full frame, so OCR
+    // boxes are remapped to full-frame space in extractWords() before being
+    // compared with the finger position.
+    @ObservationIgnored private let ocrRegionOfInterest = CGRect(x: 0.0, y: 0.2, width: 1.0, height: 0.6)
+
+    @ObservationIgnored private lazy var ocrRequest: VNRecognizeTextRequest = {
         let req = VNRecognizeTextRequest()
         req.recognitionLevel = .accurate          // 精确模式，读印刷体更准
         req.usesLanguageCorrection = true
         req.recognitionLanguages = ["en-US"]      // 只识别英文
         req.minimumTextHeight = 0.01              // 允许更小的字
+        req.regionOfInterest = ocrRegionOfInterest
         return req
     }()
 
-    private let handPoseRequest: VNDetectHumanHandPoseRequest = {
+    @ObservationIgnored private let handPoseRequest: VNDetectHumanHandPoseRequest = {
         let req = VNDetectHumanHandPoseRequest()
         req.maximumHandCount = 1
         return req
     }()
 
-    // Finger tracking — spatial + temporal, NOT text-anchored.
+    // Finger tracking — spatial + temporal, NOT text-anchored. OCR text flickers
+    // frame-to-frame, so we anchor confirmation on the fingertip's POSITION: hold
+    // roughly the same spot for hoverDuration and we confirm whatever the freshest
+    // OCR word at that spot is. Only touched on the main thread.
     //
-    // OCR text flickers frame-to-frame ("Origin"→"Orgin", word split in two),
-    // so anchoring confirmation on the recognized *string* never settles. We
-    // instead anchor on the fingertip's *position*: hold roughly the same spot
-    // for hoverDuration and we confirm, reading whatever the freshest OCR word
-    // at that spot happens to be. Only touched on the main thread.
-    private var anchorPoint: CGPoint? = nil        // vision-space point being held
-    private var anchorStart: Date? = nil
-    private let hoverDuration: TimeInterval = 0.3   // dwell before confirming the pointed word
-    private let anchorTolerance: CGFloat = 0.07    // stay within this to keep the anchor
-    // We sample the word the NAIL points at: project a point just past the
-    // fingertip along the finger's own pointing direction (knuckle → tip), then
-    // prefer the word whose box contains it. This replaces the old fixed
-    // "hand enters from below" +y guess, which grabbed whichever word sat around
-    // the hand rather than the one being pointed at.
-    private let fingerProjection: CGFloat = 0.03   // how far past the nail to sample
-    private let fingerReach: CGFloat = 0.09        // fallback: max nail→word-edge gap to count
+    // DWELL = an ACCUMULATOR with grace-holds, not a hard clock (the fix for
+    // "can't lock in a car / subway"). The old code timed CONTINUOUS stillness: any
+    // jitter frame, OCR text flicker, or dropped OCR result reset anchorStart to now
+    // and the fill snapped back to 0 — so on a shaking bus the bar climbed and reset
+    // forever and never fired. Now:
+    //   • progress ACCRUES while the finger stays on roughly one target (position-
+    //     based, so OCR text flicker doesn't count as a new target);
+    //   • a brief finger/OCR dropout HOLDS progress (a grace window) instead of
+    //     resetting — jitter can't knock the bar down, it only pauses it;
+    //   • a full reset happens only when the finger genuinely moves to a DIFFERENT
+    //     word, or leaves past the grace window.
+    // Net: shaky input still fills in about hoverDuration of cumulative good frames.
+    @ObservationIgnored private var dwellProgress: Double = 0
+    @ObservationIgnored private var dwellLastTick: Date? = nil
+    @ObservationIgnored private var dwellAnchor: CGPoint? = nil     // where the dwell is centered
+    @ObservationIgnored private var dwellWord: String? = nil       // best-known label at the anchor
+    @ObservationIgnored private var candidateLostSince: Date? = nil // OCR briefly lost the word
+    @ObservationIgnored private var fingerLostSince: Date? = nil    // hand pose briefly dropped
+    private let hoverDuration: TimeInterval = 0.65  // cumulative STILL-frame time before confirming
+    private let dwellAnchorTolerance: CGFloat = 0.045 // probe within this of the anchor = same target
+    private let candidateLostGrace: TimeInterval = 0.6 // hold the dwell through OCR dropouts
+    private let fingerLostGrace: TimeInterval = 0.4    // hold the dwell through hand-pose dropouts
+    private let dwellDtClamp: TimeInterval = 0.2       // cap per-frame dt (pauses/backgrounding)
+    private let fingerProjection: CGFloat = 0.018   // how far past the nail to sample
+    private let fingerReach: CGFloat = 0.045        // fallback: max nail→word-edge gap to count
 
-    // Color mark stabilization — keyed on POSITION, not text (same reason as above).
-    // Only touched on main thread.
-    //
-    // PER-MARK tracking with HAND-SHAKE TOLERANCE. Phones are held by hand and
-    // always drift a little; the mark's box wanders a few % every frame. Two
-    // things must survive that:
-    //   1. Identity — a frame's mark is matched to last frame's track by PROXIMITY
-    //      (nearest same-type mark within markMatchDistance), NOT by an exact grid
-    //      key. So a mark sliding across a grid boundary is still "the same mark"
-    //      and its dwell timer keeps accumulating instead of resetting.
-    //   2. Presence — a track survives brief dropouts (markGracePeriod). Detection
-    //      naturally blinks out for a frame or two under shake / motion blur; we
-    //      don't drop the track (or the published card) for that.
-    // Result: normal handheld jitter never stalls recognition or flickers a card.
-    private struct TrackedMark {
-        var mark: ColorMark
-        let firstSeen: Date
-        var lastSeen: Date
-    }
-    private var trackedMarks: [TrackedMark] = []
-    private let markStableDuration: TimeInterval = 0.4    // dwell before a mark publishes
-    private let markMatchDistance: CGFloat = 0.07         // normalized center distance = "same mark"
-    private let markGracePeriod: TimeInterval = 0.4       // keep a track through brief dropouts
-    private var anyMarkConfirming = false                 // a mark is seen but not yet stable → drives scanning pill
-
-    // isScanning debounce (main-thread only). The confirming signals below
-    // (hovering word, stabilizing mark) blink nil↔value between frames because
-    // OCR / mark detection is noisy. The "recognizing…" pill and the idle hint
-    // share the bottom slot and are mutually exclusive on isScanning, so a raw
-    // per-frame toggle made the two pills swap back and forth — the flicker. We
-    // turn the pill ON immediately, but only turn it OFF after the confirming
-    // signal has stayed gone for scanningOffGrace, so a momentary gap can't drop it.
-    private var scanningOffSince: Date? = nil
+    // isScanning debounce (main-thread only). Rising edge immediate; falling edge
+    // waits scanningOffGrace so a one-frame OCR dropout can't blink the pill out.
+    @ObservationIgnored private var scanningOffSince: Date? = nil
     private let scanningOffGrace: TimeInterval = 0.45
 
-    // OCR / color scan are heavy — run them every N frames and reuse the last
-    // result in between. Hand pose stays every-frame so the finger dot is smooth.
-    private var frameCounter = 0
-    private let heavyWorkInterval = 2
-    private var lastWords: [DetectedWord] = []
-    private var lastMarks: [ColorMark] = []
+    // OCR is heavy — run it every N frames and reuse the last result in between.
+    // Hand pose stays every-frame so the finger dot is smooth. Every 3rd frame
+    // (~0.3s at our fps) keeps the word list fresh enough that the dot lands on a
+    // just-arrived word quickly, without paying OCR's cost on every frame.
+    @ObservationIgnored private var frameCounter = 0
+    private let heavyWorkInterval = 3
+    @ObservationIgnored private var lastWords: [DetectedWord] = []
 
-    // Finger stillness (processing-queue only) — tells a POINTING hand (held
-    // still over a word) apart from a DRAWING hand (moving a pen along a line).
-    // A still finger suppresses mark detection so pointing stays authoritative;
-    // a moving hand lets underline/circle detection run so drawing is still read.
-    private var lastFingerPoint: CGPoint? = nil
-    private var fingerStillSince: Date? = nil
-    private let fingerStillTolerance: CGFloat = 0.03   // vision-space wobble allowed
-    private let fingerStillDelay: TimeInterval = 0.25  // held this long → "pointing"
+    // Diagnostic heartbeat (processing-queue only) — a one-line pipeline snapshot
+    // every diagLogInterval seconds, mirrored into diagLine for the on-screen HUD.
+    @ObservationIgnored private var diagLastLog: Date = .distantPast
+    @ObservationIgnored private var diagFrameCount = 0
+    private let diagLogInterval: TimeInterval = 1.0
 
-    // Most recent frame as a small JPEG — captured when a word is saved so the
-    // library card can show the page the user was reading. Updated on heavy frames.
-    private let snapshotLock = NSLock()
-    private var lastSnapshot: Data? = nil
-    private var lastSnapshotTime: Date = .distantPast
-    private let snapshotInterval: TimeInterval = 0.6   // throttle heavy JPEG encoding
+    // Finger entry mute (processing-queue only) — ignore the first fingerEntryMute
+    // after a hand appears, so a hand merely sweeping into frame can't instantly
+    // start accruing dwell on whatever it passes over first.
+    @ObservationIgnored private var fingerFirstSeen: Date? = nil
+    private let fingerEntryMute: TimeInterval = 0.12
 
-    // Returns a downscaled JPEG of the current camera frame (for library thumbnails).
+    // Finger POSITION smoothing + outlier rejection (processing-queue only).
+    // Vision's per-frame tip is noisy and occasionally teleports to a mislabeled
+    // joint. smoothedFinger is an exponential moving average so the dot glides
+    // instead of buzzing; a raw sample that jumps more than fingerJumpReject from
+    // the smoothed position is treated as a glitch and DROPPED (the dot holds
+    // still), which is what stops the one-frame leap onto the thumb. A few
+    // consecutive far samples (genuine fast move) overrides the guard so we don't
+    // get stuck — see updateSmoothedFinger.
+    @ObservationIgnored private var smoothedFinger: CGPoint? = nil
+    @ObservationIgnored private var fingerRejectStreak = 0
+    private let fingerSmoothing: CGFloat = 0.5      // 0 = no smoothing, 1 = frozen
+    private let fingerJumpReject: CGFloat = 0.12    // normalized dist that counts as a teleport
+    private let fingerRejectLimit = 3               // this many far samples = real move, accept
+
+    // STILLNESS GATE (processing-queue only). "毫秒级出结果" is only safe if a fast
+    // finger SWEEPING across the page can't fire — the dwell window can then be tiny
+    // because settling itself is the intent signal. We measure the smoothed tip's
+    // speed (normalized units / sec) between frames: below fingerStillSpeed = "still".
+    // updatePointedWord accrues dwell ONLY while still, so a moving finger racks up no
+    // progress no matter how short hoverDuration is. lastStillSample/At hold the prior
+    // sample for the speed estimate.
+    @ObservationIgnored private var lastStillSample: CGPoint? = nil
+    @ObservationIgnored private var lastStillAt: Date? = nil
+    @ObservationIgnored private var fingerStill = false
+    private let fingerStillSpeed: CGFloat = 0.35    // norm units/sec under which the finger counts as parked
+
+    // DIRECTION smoothing (processing-queue only). The probe = fingertip + dir*projection.
+    // The tip is EMA-smoothed, but dir was recomputed RAW from the MCP→tip joints every
+    // frame, so the projected probe jittered even when the tip was steady. We EMA the
+    // direction too (as a vector, then renormalize) so the probe — and thus the dot and
+    // the word hit-test — sits still on the pointed word.
+    @ObservationIgnored private var smoothedDir: CGVector? = nil
+    private let dirSmoothing: CGFloat = 0.6         // 0 = no smoothing, 1 = frozen
+
+    // Most recent frame kept ONLY as a live pixel-buffer reference, encoded to JPEG
+    // lazily (once, at lock time) — never on the hot path. Retaining the buffer each
+    // heavy frame is near-zero cost; the constant full-res encode the old code did
+    // every 0.6s was a real thermal bug that throttled the pipeline.
+    @ObservationIgnored private let snapshotLock = NSLock()
+    @ObservationIgnored private var latestPixelBuffer: CVPixelBuffer? = nil   // guarded by snapshotLock
+
+    @ObservationIgnored private let ciContext = CIContext()
+
+    // Encode the most recent retained frame to a JPEG on demand — called once when a
+    // word locks (main thread), NOT per frame. Full capture resolution capped at
+    // 1600px, quality 0.9, so the full-screen detail page stays crisp (~150-300KB).
     func currentSnapshot() -> Data? {
         snapshotLock.lock()
-        defer { snapshotLock.unlock() }
-        return lastSnapshot
+        let pb = latestPixelBuffer
+        snapshotLock.unlock()
+        guard let pb else { return nil }
+
+        let ci = CIImage(cvPixelBuffer: pb).oriented(.right)
+        let extent = ci.extent
+        let maxSide = max(extent.width, extent.height)
+        guard maxSide > 0 else { return nil }
+        let scale = min(1.0, 1600.0 / maxSide)
+        let scaled = scale < 1.0 ? ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) : ci
+        guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return nil }
+        return UIImage(cgImage: cg).jpegData(compressionQuality: 0.9)
     }
 
     // Freeze the preview: render the next frame full-screen as a still and publish
     // it. The live session keeps running underneath (cheaper than stop/restart and
     // avoids a black flash on resume) — the still just covers it.
     func freeze() {
+        // Mark intent on the main thread FIRST, so a racing unfreeze() (also main)
+        // can revoke it deterministically. Then ask the frame queue for a still.
+        assertMainThenSet(intended: true)
         processingQueue.async { [weak self] in self?.freezeRequested = true }
     }
 
-    // Resume live preview.
+    // Resume live preview. Revoke the freeze intent (so a still that hasn't been
+    // rendered yet is never applied) and drop any still already on screen.
     func unfreeze() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.frozenImage != nil else { return }
-            self.frozenImage = nil
+            guard let self else { return }
+            self.freezeIntended = false
+            if self.frozenImage != nil { self.frozenImage = nil }
         }
     }
 
-    private let ciContext = CIContext()
+    // Set freezeIntended on the main thread. (freeze() may be called from main
+    // already; dispatch keeps the ordering with unfreeze() well-defined either way.)
+    private func assertMainThenSet(intended: Bool) {
+        if Thread.isMainThread {
+            freezeIntended = intended
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.freezeIntended = intended }
+        }
+    }
 
-    // Frame watchdog — a session can report isRunning while silently delivering
-    // no frames (some capture errors post no notification). If frames stall past
-    // frameStallTimeout, force a full restart. Cooldown avoids thrashing.
-    private let frameLock = NSLock()
-    private var lastFrameTime: Date = .distantPast
-    private var watchdog: Timer?
-    private let frameStallTimeout: TimeInterval = 2.0
-    private var lastRestartTime: Date = .distantPast   // main-thread only
-    private let restartCooldown: TimeInterval = 3.0
-    // Our INTENT: true between start() and stop(). The watchdog recovers on this,
-    // not on session.isRunning — a system interruption (call, Control Center,
-    // another camera client, thermal) forces isRunning false, and iOS often never
-    // delivers interruptionEnded, so gating recovery on isRunning would leave us
-    // permanently frozen (the "stuck on a dead camera frame" bug). We know we
-    // should be live, so we retry regardless of the session's current flag.
-    private var shouldBeRunning = false                // main-thread only
+    // Whether the app is the foreground app right now (driven by scenePhase). iOS
+    // makes the camera UNAVAILABLE in the background, so we never call startRunning()
+    // while backgrounded. Atomic because the session queue reads it.
+    @ObservationIgnored private let foregroundLock = NSLock()
+    @ObservationIgnored private var _isForeground = true
+    private func isForeground() -> Bool {
+        foregroundLock.lock(); defer { foregroundLock.unlock() }
+        return _isForeground
+    }
+    func setForeground(_ on: Bool) {
+        foregroundLock.lock()
+        _isForeground = on
+        foregroundLock.unlock()
+    }
 
     override init() {
         super.init()
         setupCamera()
     }
 
-    // Force the scanning latch back to idle. Called when the view (re)enters the
-    // live screen: on resume the capture session restarts and no frame has yet
-    // arrived to recompute isScanning, so a value left true from before
-    // backgrounding would linger and suppress the idle hint for its whole window.
-    // At an entry point we are idle by definition, so clearing it is safe.
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // Force the scanning latch back to idle. Called at entry points where we are
+    // idle by definition, so a value left true from before can't linger.
     func resetScanningState() {
         scanningOffSince = nil
         if isScanning { isScanning = false }
     }
 
-    // Wipe ALL detection outputs. Called when a result card is dismissed / the
-    // user taps 重新识别. Without this, pointedWord / colorMarks / the hover
-    // anchor keep their values from the LAST recognition, so the very next frame
-    // re-fires recompute() with stale data — a card pops up instantly (before the
-    // finger even settles) showing the PREVIOUS word, not what's under the finger
-    // now. Clearing everything forces a fresh confirmation from a clean slate.
+    // Wipe ALL detection outputs — called when a card is dismissed / 重新识别. Without
+    // this the next frame re-fires recompute() with the stale pointed word.
     func resetDetection() {
         pointedWord = nil
         hoveringWord = nil
         hoveringText = nil
-        anchorPoint = nil
-        anchorStart = nil
-        colorMarks = []
-        trackedMarks.removeAll()
+        dwellProgress = 0
+        dwellLastTick = nil
+        dwellAnchor = nil
+        dwellWord = nil
+        candidateLostSince = nil
+        fingerLostSince = nil
+        pointingProgress = 0
+        fingerProbePoint = nil
         resetScanningState()
     }
 
     // MARK: - Setup
 
     private func setupCamera() {
-        session.sessionPreset = .hd1280x720
-
-        guard
-            let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-            let input = try? AVCaptureDeviceInput(device: device)
-        else { return }
-
-        if session.canAddInput(input) { session.addInput(input) }
-
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
-        videoOutput.setSampleBufferDelegate(self, queue: processingQueue)
-        if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
-
         observeSessionHealth()
+        // Configure ONCE, off the main thread. The graph is built a single time and
+        // kept for the app's lifetime; start/stop just toggle running.
+        sessionQueue.async { [weak self] in self?.ensureConfigured() }
     }
 
-    // The capture source can hit a runtime error (err=-17281) or get interrupted
-    // by the system; AVFoundation does NOT auto-recover. Without this the preview
-    // keeps showing but frames stop flowing — recognition silently dies after a
-    // few seconds. Restart the session whenever that happens.
+    // Idempotent capture-graph configuration. ALWAYS runs on the SESSION queue. Adds
+    // whatever's missing — a video input and our video output — and is a pure
+    // guard-return once both are present. NO teardown, NO churn on the happy path.
+    private func ensureConfigured() {
+        let hasInput = session.inputs.contains {
+            ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.video) == true
+        }
+        let hasOutput = session.outputs.contains { $0 === videoOutput }
+        guard !hasInput || !hasOutput else { return }
+
+        session.beginConfiguration()
+        session.sessionPreset = .hd1280x720
+
+        // Keep the camera running in a multi-app / Split View layout. Without this,
+        // iOS interrupts the session (reason=4) and per Apple's docs it "may only run
+        // if your app occupies the full screen" — a common black-preview cause.
+        // Guarded because it isn't supported on every device.
+        if session.isMultitaskingCameraAccessSupported {
+            session.isMultitaskingCameraAccessEnabled = true
+        }
+
+        if !hasInput,
+           let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+           let input = try? AVCaptureDeviceInput(device: device),
+           session.canAddInput(input) {
+            session.addInput(input)
+            configureFocus(device)
+        }
+
+        if !hasOutput {
+            videoOutput.alwaysDiscardsLateVideoFrames = true
+            videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+            videoOutput.setSampleBufferDelegate(self, queue: processingQueue)
+            if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
+        }
+
+        session.commitConfiguration()
+    }
+
+    // Tune focus for the "finger on paper / finger at a billboard" use case. We AIM
+    // autofocus explicitly at the word the finger points at (see refocus(onVisionPoint:)),
+    // AND restrict the range to .far. Both matter:
+    //   • The POI puts the focus on the pointed text specifically.
+    //   • .far keeps AF from ever racking all the way to macro. Without it, AF could
+    //     grab the very-near fingertip for an instant and then hunt the ENTIRE lens
+    //     travel back out to the distant sign — a 6-8s "everything blurs then slowly
+    //     re-sharpens" pump the user saw. Both a near book and a far sign are still
+    //     comfortably inside .far (it excludes only extreme macro), so nothing we care
+    //     about is lost. This is the fix for the auto-recovering blur regression.
+    // Continuous AF (a moved page/target re-sharpens) and smooth AF (damps visible
+    // pumping) stay. Best-effort — every capability is guarded.
+    private func configureFocus(_ device: AVCaptureDevice) {
+        do {
+            try device.lockForConfiguration()
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isSmoothAutoFocusSupported {
+                device.isSmoothAutoFocusEnabled = true
+            }
+            if device.isAutoFocusRangeRestrictionSupported {
+                device.autoFocusRangeRestriction = .far
+            }
+            // Cap capture to 15fps. Our Vision pipeline only keeps up with ~10fps, so
+            // running the sensor at 30 just pays thermal/power cost for frames we
+            // discard — and sustained heat is what makes iOS reclaim the source.
+            let capFPS = 15.0
+            if let range = device.activeFormat.videoSupportedFrameRateRanges.first,
+               range.minFrameRate <= capFPS {
+                let dur = CMTime(value: 1, timescale: CMTimeScale(capFPS))
+                device.activeVideoMinFrameDuration = dur
+                device.activeVideoMaxFrameDuration = dur
+            }
+            device.unlockForConfiguration()
+        } catch {
+            // Couldn't lock (device busy mid-transition) — the default AF still works.
+        }
+    }
+
+    // Observe session health. We deliberately react to almost nothing: iOS owns
+    // interruptions and resumes the session on its own. The ONE runtime error worth
+    // reacting to is mediaServicesWereReset — the media server genuinely bounced and
+    // our session needs re-arming.
     private func observeSessionHealth() {
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(sessionRuntimeError(_:)),
                        name: AVCaptureSession.runtimeErrorNotification, object: session)
-        nc.addObserver(self, selector: #selector(sessionInterruptionEnded(_:)),
-                       name: AVCaptureSession.interruptionEndedNotification, object: session)
-        // Also observe the START of an interruption. iOS does NOT reliably deliver
-        // interruptionEnded (especially after the interruptor — a call, Control
-        // Center, another camera client — goes away), so we can't rely on it to
-        // restart. We record that we were interrupted; the watchdog then recovers
-        // us on its own, gated on INTENT (shouldBeRunning) rather than on the
-        // session's current isRunning, which an interruption forces false.
         nc.addObserver(self, selector: #selector(sessionWasInterrupted(_:)),
                        name: AVCaptureSession.wasInterruptedNotification, object: session)
+        nc.addObserver(self, selector: #selector(sessionInterruptionEnded(_:)),
+                       name: AVCaptureSession.interruptionEndedNotification, object: session)
     }
 
     @objc private func sessionRuntimeError(_ note: Notification) {
         let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-        print("🔴 相机会话运行时错误：\(err?.code ?? 0) — 尝试重启")
-        restartSession()
+        let code = err?.code ?? 0
+        print("🔴 相机会话运行时错误：\(code)")
+        // Only the media server reset warrants a re-arm. For everything else — notably
+        // the -17281 "capture source" family, which is informational log noise on
+        // iOS 26 — do NOTHING. An immediate restart there just re-hammers a server
+        // that's already fine, and THAT churn is what wedged the camera before.
+        guard code == AVError.Code.mediaServicesWereReset.rawValue else { return }
+        sessionQueue.async { [weak self] in
+            guard let self, self.isForeground() else { return }
+            self.ensureConfigured()
+            if !self.session.isRunning { self.session.startRunning() }
+        }
     }
 
     @objc private func sessionWasInterrupted(_ note: Notification) {
         let reason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int ?? -1
-        print("🟡 相机会话被系统中断：reason=\(reason) — 依赖看门狗自愈")
+        // Frame delivery pauses during an interruption (backgrounded, another camera
+        // client, multi-app, a call). iOS resumes the session itself. We just log —
+        // fighting the system here is what thrashed the shared camera server.
+        print("🟡 相机会话被系统中断：reason=\(reason) — 等待系统恢复")
     }
 
     @objc private func sessionInterruptionEnded(_ note: Notification) {
-        restartSession()
-    }
-
-    // Recovery escalates. A plain stop/start (level 0) fixes most stalls cheaply.
-    // But when the system reclaims the camera (another client, thermal, resource
-    // pressure) a bare restart of the SAME session often can't get it back — the
-    // input is dead. On the next attempt we escalate to a FULL rebuild: rip the
-    // input/output out and reconfigure from scratch, which reacquires the device.
-    private var restartLevel = 0                       // processing-queue only
-
-    private func restartSession() {
-        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
-        markFrameSeen()   // give the restart a fresh grace window before the watchdog fires again
-        processingQueue.async { [weak self] in
-            guard let self else { return }
-            if self.restartLevel == 0 {
-                // Cheap path: just bounce the running session.
-                if self.session.isRunning { self.session.stopRunning() }
-                self.session.startRunning()
-                self.restartLevel = 1
-            } else {
-                // Escalated path: fully rebuild the capture graph to reacquire the
-                // device the system took away.
-                self.rebuildSession()
-            }
-        }
-    }
-
-    // Tear the capture graph down and build it back up. Reacquires the camera
-    // device from scratch — the only reliable way back after the system hands the
-    // camera to another client and never returns it via interruptionEnded.
-    private func rebuildSession() {
-        session.beginConfiguration()
-        for input in session.inputs { session.removeInput(input) }
-        for output in session.outputs { session.removeOutput(output) }
-        session.commitConfiguration()
-
-        session.sessionPreset = .hd1280x720
-        if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-           let input = try? AVCaptureDeviceInput(device: device),
-           session.canAddInput(input) {
-            session.addInput(input)
-        }
-        if session.canAddOutput(videoOutput) { session.addOutput(videoOutput) }
-
-        if session.isRunning { session.stopRunning() }
-        session.startRunning()
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-        watchdog?.invalidate()
+        // The interruption cleared; AVCaptureSession auto-resumes if it was running.
+        // No forced restart on top of the system's own resume.
+        print("🟢 相机中断结束 — 系统自动恢复帧流")
     }
 
     // MARK: - Lifecycle
@@ -312,28 +506,20 @@ class CameraManager: NSObject, ObservableObject {
                 if granted {
                     self?.setDenied(false)
                     self?.startSession()
-                    // Fire the network probe right after camera is granted, so the
-                    // iOS "wireless data" prompt appears now instead of waiting for
-                    // the first word lookup.
                     self?.probeNetworkPermission()
                 } else {
                     self?.setDenied(true)
                 }
             }
         default:
-            // Denied or restricted — surface the settings fallback.
             setDenied(true)
         }
     }
 
-    // Trigger the iOS network-permission prompt eagerly, right after camera
-    // access is granted, rather than lazily on the first word lookup. On
-    // China-region iOS the "wireless data" dialog only appears on the app's first
-    // outbound connection; making that connection now means the user answers it
-    // up front and the first real lookup isn't spent on the prompt. Fire-and-
-    // forget: we hit the same proxy host (so it's the same permission scope),
-    // ignore the response, and run at most once per launch.
-    private var didProbeNetwork = false
+    // Trigger the iOS network-permission prompt eagerly, right after camera access is
+    // granted, so the user answers it up front instead of on the first word lookup.
+    // Fire-and-forget, at most once per launch.
+    @ObservationIgnored private var didProbeNetwork = false
     private static let probeSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
@@ -345,15 +531,13 @@ class CameraManager: NSObject, ObservableObject {
     private func probeNetworkPermission() {
         guard !didProbeNetwork else { return }
         didProbeNetwork = true
-        guard let url = URL(string: Config.apiProxyURL) else { return }
-
+        guard let url = URL(string: Config.apiURL) else { return }
         var req = URLRequest(url: url)
-        req.httpMethod = "HEAD"          // no body needed — we only want the connection to open
-        let task = Self.probeSession.dataTask(with: req) { _, _, _ in
-            // Result is irrelevant. The point was to open a connection so iOS
-            // shows its network dialog now; success/failure both satisfy that.
-        }
-        task.resume()
+        req.httpMethod = "HEAD"
+        // Unauthenticated HEAD — it will bounce (401/405), which is fine: the only
+        // goal is to trigger the iOS "wireless data" permission prompt up front so
+        // the first real word lookup isn't sacrificed to it.
+        Self.probeSession.dataTask(with: req) { _, _, _ in }.resume()
     }
 
     private func setDenied(_ denied: Bool) {
@@ -363,106 +547,125 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // Start the session. All work is ASYNC on the session queue — never a
+    // synchronous hop from main. Idempotent: reconfigure if needed, then start only
+    // if not already running.
     private func startSession() {
-        shouldBeRunning = true            // record intent so the watchdog can recover us
-        guard !session.isRunning else { return }
-        markFrameSeen()   // start the grace window now, before frames arrive
-        processingQueue.async { self.session.startRunning() }
-        startWatchdog()
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
+        setForeground(true)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.ensureConfigured()
+            // scenePhase can flip to background between the caller and this block.
+            // Starting the camera while backgrounded is the reason=1 / server-thrash
+            // trap, so re-check here.
+            guard self.isForeground() else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+        }
     }
 
+    // Stop the session — called from scenePhase == .background and onDisappear.
+    // ASYNC on the session queue (canonical AVCam). The old code did a
+    // `sessionQueue.sync` FROM THE MAIN THREAD, which hangs the UI whenever the queue
+    // is busy — a freeze cause in its own right. A background-task assertion gives
+    // the async stop time to finish even as the app suspends.
     func stop() {
-        shouldBeRunning = false           // deliberate stop — watchdog must NOT fight it
-        stopWatchdog()
-        processingQueue.async { self.session.stopRunning() }
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "pw.camera.stop")
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+                return
+            }
+            if self.session.isRunning { self.session.stopRunning() }
+            if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+        }
         // The next start must wait for a fresh first frame before the preview is
-        // considered live again. Without this reset, isPreviewLive stays true
-        // across a stop/start, so the hint-and-detection resume logic that gates
-        // on "first frame arrived" thinks pixels are already flowing and never
-        // re-arms — a big reason the app "went dead" on the second entry.
+        // considered live again.
         DispatchQueue.main.async { [weak self] in
             self?.isPreviewLive = false
-            self?.isStalled = false
         }
     }
 
-    // MARK: - Frame watchdog
+    // Steer continuous autofocus at the WORD the finger points at, so the plane that
+    // gets sharp is the text — near (a book) or far (a billboard) — not whatever sits
+    // in the frame center. This is what makes the distant-sign case work: AF locks on
+    // the far text (the finger goes soft, an accepted depth-of-field trade), and it
+    // also self-bootstraps — the aim uses the probe's SCREEN position, so it sharpens
+    // that spot even before OCR reads a single word there.
+    //
+    // Called from the main-thread UI publish with the current Vision probe point.
+    // Two-stage convert, both legs TRUSTED:
+    //   Vision(norm, bottom-left) → layer point   … same aspect-fill math as the dot
+    //   layer point → device POI                  … Apple's captureDevicePointConverted
+    // Throttled hard (distance + interval) so AF doesn't pump. Best-effort throughout.
+    func refocus(onVisionPoint visionPoint: CGPoint?) {
+        guard let visionPoint, let layer = previewLayer else { return }
 
-    private func markFrameSeen() {
-        frameLock.lock()
-        lastFrameTime = Date()
-        frameLock.unlock()
-    }
+        // Vision (normalized, bottom-left origin) → point in the preview LAYER's
+        // coordinates, using the exact aspect-fill mapping the green dot uses.
+        let bounds = layer.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let scale = max(bounds.width / focusImageSize.width, bounds.height / focusImageSize.height)
+        let cropX = (focusImageSize.width * scale - bounds.width) / 2
+        let cropY = (focusImageSize.height * scale - bounds.height) / 2
+        let layerPoint = CGPoint(
+            x: visionPoint.x * focusImageSize.width * scale - cropX,
+            y: (1 - visionPoint.y) * focusImageSize.height * scale - cropY
+        )
 
-    // A word is usable for MARK detection unless its box is clipped by the frame
-    // edge. A cropped fragment ("developers"→"lopers") has a box that runs right
-    // up to a border, and the strip just outside it collides with the frame edge /
-    // neighbouring line and false-fires as an underline. We reject ONLY words that
-    // actually touch an edge (within a small epsilon) — not a wide inset, which
-    // previously (margin 0.12) also threw away perfectly framed words near the
-    // sides, so their underline/circle "couldn't be detected". Finger pointing
-    // uses the full word list, so pointing at an edge word is unaffected.
-    private func isCentered(_ box: CGRect) -> Bool {
-        let edge: CGFloat = 0.02
-        return box.minX > edge && box.maxX < 1 - edge
-            && box.minY > edge && box.maxY < 1 - edge
-    }
+        // Layer point → device point of interest ([0,1], top-left in device space).
+        // Apple's converter accounts for videoGravity (.resizeAspectFill) and rotation,
+        // so we don't hand-roll the orientation transform that was the risky part.
+        let poi = layer.captureDevicePointConverted(fromLayerPoint: layerPoint)
+        guard poi.x >= 0, poi.x <= 1, poi.y >= 0, poi.y <= 1 else { return }
 
-    private func startWatchdog() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.watchdog == nil else { return }
-            let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-                self?.checkFrameFlow()
+        // Anti-pump throttle: skip if the target barely moved and we re-aimed recently.
+        let now = Date()
+        if let last = lastFocusPoint,
+           hypot(poi.x - last.x, poi.y - last.y) < focusMoveThreshold,
+           now.timeIntervalSince(lastFocusAt) < focusMinInterval {
+            return
+        }
+        lastFocusPoint = poi
+        lastFocusAt = now
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard let device = (self.session.inputs
+                .compactMap { $0 as? AVCaptureDeviceInput }
+                .first { $0.device.hasMediaType(.video) })?.device else { return }
+            guard device.isFocusPointOfInterestSupported else { return }
+            do {
+                try device.lockForConfiguration()
+                device.focusPointOfInterest = poi
+                // ONE-SHOT autofocus — NOT continuous. This is the fix for the
+                // "background blurs then slowly re-sharpens over 6-8s" hunt. In
+                // .continuousAutoFocus, moving focusPointOfInterest restarts a scan,
+                // and the device also hunts autonomously on any scene change; a
+                // handheld probe drifting past the throttle every ~0.8s therefore kept
+                // restarting scans so the lens never settled. A single .autoFocus
+                // converges on the pointed word once and HOLDS. The next real re-aim
+                // (finger moved past focusMoveThreshold) fires exactly one more scan.
+                // Holding also suits a moving car/subway: the page's focus distance is
+                // ~constant, so a lock stays sharp instead of hunting on motion blur.
+                // Falls back to continuous only where one-shot focus isn't available.
+                if device.isFocusModeSupported(.autoFocus) {
+                    device.focusMode = .autoFocus
+                } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                // Bias exposure at the same spot so the text is well-lit too — cheap,
+                // and it makes distant/backlit signs read better.
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = poi
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                }
+                device.unlockForConfiguration()
+            } catch {
+                // Device busy mid-transition — default continuous AF still works.
             }
-            // .common so it keeps firing during scroll / interaction.
-            RunLoop.main.add(timer, forMode: .common)
-            self.watchdog = timer
-        }
-    }
-
-    private func stopWatchdog() {
-        DispatchQueue.main.async { [weak self] in
-            self?.watchdog?.invalidate()
-            self?.watchdog = nil
-        }
-    }
-
-    // Runs on the main thread once a second. Recovers whenever frames have stalled
-    // while we intend to be live — gated on shouldBeRunning, NOT session.isRunning.
-    // A system interruption forces isRunning false and iOS may never send
-    // interruptionEnded, so an isRunning gate would freeze us forever. As long as
-    // WE meant to be running and frames dried up, restart (subject to cooldown).
-    private func checkFrameFlow() {
-        guard shouldBeRunning else { return }
-
-        frameLock.lock()
-        let since = Date().timeIntervalSince(lastFrameTime)
-        frameLock.unlock()
-
-        guard since >= frameStallTimeout else { return }
-
-        // Frames have dried up while we mean to be live → tell the UI so it can
-        // stop looking dead and offer a manual recover tap. Cleared the instant a
-        // real frame arrives again (see captureOutput).
-        if !isStalled { isStalled = true }
-
-        guard Date().timeIntervalSince(lastRestartTime) >= restartCooldown else { return }
-
-        lastRestartTime = Date()
-        print("🔴 看门狗：\(String(format: "%.1f", since))s 无新帧 (isRunning=\(session.isRunning)) — 强制重启会话")
-        restartSession()
-    }
-
-    // Manual recovery — the on-screen "tap to recover" affordance calls this.
-    // Escalates straight to a full rebuild (skip the cheap bounce that the
-    // watchdog already tried) and re-arms our run intent.
-    func forceRecover() {
-        shouldBeRunning = true
-        startWatchdog()
-        markFrameSeen()
-        processingQueue.async { [weak self] in
-            self?.restartLevel = 1
-            self?.rebuildSession()
         }
     }
 }
@@ -477,23 +680,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        markFrameSeen()   // heartbeat for the frame watchdog
-
-        // Real frames are flowing again → recovery worked. Reset the escalation
-        // ladder so the next stall starts cheap again, and clear the stalled flag
-        // that surfaces the on-screen recover affordance.
-        restartLevel = 0
-        if isStalled {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isStalled else { return }
-                self.isStalled = false
-            }
-        }
-
-        // First real frame → the preview is now showing pixels. The idle hint
-        // waits on this so its display window starts when the page is visible,
-        // not during the black startup gap (which was eating the whole window on
-        // cold launch, so the hint "never appeared").
+        // First real frame → the preview is now showing pixels. The idle hint waits
+        // on this so its window starts when the page is visible.
         if !isPreviewLive {
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.isPreviewLive else { return }
@@ -502,75 +690,118 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         frameCounter += 1
-        // OCR + color scan are expensive; only run them every heavyWorkInterval frames.
         let runHeavy = (frameCounter % heavyWorkInterval == 0)
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
 
-        // Hand pose is light — always run it so finger tracking stays smooth.
-        // OCR only runs on heavy frames.
-        let requests: [VNRequest] = runHeavy ? [ocrRequest, handPoseRequest] : [handPoseRequest]
+        // Hand pose and OCR run as SEPARATE perform() calls — never bundled. The blue
+        // dot, scan hint and card ALL ride on captureOutput publishing finger/word
+        // results; when the two shared one perform(), a slow OCR pass on a dense page
+        // blocked/aborted the whole call and the light hand-pose result never came out
+        // either. Now hand pose runs on its own handler first and its result is used no
+        // matter what OCR does; OCR is isolated so its failure only skips one refresh.
+        var finger: CGPoint? = nil
+        var fingerData: (tip: CGPoint, dir: CGVector)? = nil
         do {
-            try handler.perform(requests)
-        } catch { return }
-
-        let fingerData = fingerTip(from: handPoseRequest.results?.first)
-        let finger = fingerData?.tip
-        let fingerIsPointing = updateFingerStillness(finger)
+            try handler.perform([handPoseRequest])
+            fingerData = fingerTip(from: handPoseRequest.results?.first)
+            finger = fingerData?.tip
+        } catch {
+            // No finger this tick — but we DON'T return: the UI publish below still
+            // runs so a stale dot clears instead of freezing on screen.
+        }
+        // Smooth the raw tip and drop teleport glitches (mislabeled joints) BEFORE
+        // it drives the dot and the dwell — so the dot glides and never leaps to a
+        // thumb for one frame. Direction keeps using the raw tip (it's a local
+        // vector, not a screen position, so smoothing it adds nothing).
+        finger = updateSmoothedFinger(finger)
+        let withinEntryMute = updateEntryMute(finger)
+        let still = updateStillness(finger)
+        // Smooth the pointing direction too (the tip is already smoothed) so the
+        // projected probe doesn't jitter frame-to-frame. Cleared when the finger drops.
+        let smoothedDirection = updateSmoothedDir(finger != nil ? fingerData?.dir : nil)
 
         if runHeavy {
-            lastWords = extractWords()
-            // Arbitration between the two core gestures:
-            //   • Finger held STILL over a word = pointing. Suppress mark detection
-            //     so a colored cover / underline-looking texture can never
-            //     pre-empt the word being pointed at.
-            //   • Hand MOVING (or absent) = the user may be drawing an underline /
-            //     circle with a pen. Run mark detection so drawing is still read
-            //     even though a hand is in frame.
-            if fingerIsPointing {
-                lastMarks = []
-            } else {
-                // Only look for marks on words that sit COMFORTABLY INSIDE the
-                // frame. Words cropped by the screen edge (e.g. "developers" →
-                // "lopers", "discount" → "ount") have broken boxes; the strip
-                // below them collides with the frame border / neighbouring line
-                // and false-triggers as an underline — repeatedly winning over
-                // the actual centered word the user marked. Dropping edge-cropped
-                // words from mark candidates removes that whole error class.
-                // Finger pointing still uses the full word list (below), so a
-                // pointed edge word is unaffected.
-                let central = lastWords.filter { isCentered($0.boundingBox) }
-                lastMarks = colorMarkService.detectAll(in: pixelBuffer, words: central)
+            do {
+                let ocrHandler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+                try ocrHandler.perform([ocrRequest])
+                lastWords = extractWords()
+            } catch {
+                // Keep the previous words; a single missed OCR pass is invisible.
             }
-            updateSnapshot(from: pixelBuffer)
+            // Retain THIS frame for a possible snapshot — a cheap reference, no encode.
+            snapshotLock.lock()
+            latestPixelBuffer = pixelBuffer
+            snapshotLock.unlock()
         }
         let words = lastWords
-        let marks = lastMarks
 
-        // A freeze was requested — render this frame full-res, oriented to match
-        // the preview, and publish it. Do it here so it captures a fresh frame.
+        // Diagnostic heartbeat — throttled to ~1s. If this keeps printing with fps>0,
+        // the camera is delivering frames; a blank screen is then a DETECTION gap
+        // (words 0) or a UI issue, not a capture stall.
+        diagFrameCount += 1
+        let dnow = Date()
+        if dnow.timeIntervalSince(diagLastLog) >= diagLogInterval {
+            let fps = Double(diagFrameCount) / max(0.001, dnow.timeIntervalSince(diagLastLog))
+            print(String(format: "📷 帧流 fps=%.0f | words=%d | finger=%@ | running=%@",
+                         fps, words.count,
+                         finger != nil ? "有" : "无",
+                         session.isRunning ? "是" : "否"))
+            let running = session.isRunning
+            let hasFinger = finger != nil
+            let wc = words.count
+            DispatchQueue.main.async { [weak self] in
+                self?.diagLine = String(format: "fps=%.0f w=%d f=%@ run=%@",
+                                        fps, wc, hasFinger ? "Y" : "N", running ? "Y" : "N")
+            }
+            diagLastLog = dnow
+            diagFrameCount = 0
+        }
+
+        // A freeze was requested — render this frame full-res, oriented to match the
+        // preview, and publish it. Apply it on main ONLY if the freeze is still
+        // intended: the user may have tapped 重新识别 (unfreeze) between the request
+        // and now, in which case freezeIntended was revoked and we must NOT slap a
+        // stale still over the live preview (that was the stuck-frozen-frame bug).
         if freezeRequested {
             freezeRequested = false
-            let still = renderFullFrame(from: pixelBuffer)
-            DispatchQueue.main.async { [weak self] in self?.frozenImage = still }
+            let stillImage = renderFullFrame(from: pixelBuffer)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.freezeIntended else { return }
+                self.frozenImage = stillImage
+            }
         }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if runHeavy {
                 self.detectedWords = words
-                self.updateColorMarks(marks)
             }
             self.fingerVisionPoint = finger
-            self.updatePointedWord(finger: finger, dir: fingerData?.dir,
-                                   words: words, pointing: fingerIsPointing)
+            self.updatePointedWord(finger: finger, dir: smoothedDirection,
+                                   words: words, withinEntryMute: withinEntryMute,
+                                   still: still)
             self.updateScanningState()
+            // Steer AF at what the finger points at (probe = the read spot; fall back
+            // to the raw tip on the very first frame before a probe is computed). The
+            // method self-throttles, so calling it every publish is cheap.
+            self.refocus(onVisionPoint: self.fingerProbePoint ?? finger)
         }
     }
 
     private func extractWords() -> [DetectedWord] {
         guard let results = ocrRequest.results else { return [] }
         var words: [DetectedWord] = []
+
+        // Vision returns bounding boxes relative to the ROI sub-rect. Map each back
+        // into full-frame normalized space so they line up with finger coordinates.
+        let roi = ocrRegionOfInterest
+        func toFullFrame(_ b: CGRect) -> CGRect {
+            CGRect(x: roi.origin.x + b.origin.x * roi.width,
+                   y: roi.origin.y + b.origin.y * roi.height,
+                   width: b.width * roi.width,
+                   height: b.height * roi.height)
+        }
 
         for obs in results {
             guard let candidate = obs.topCandidates(1).first, candidate.confidence > 0.3 else { continue }
@@ -586,7 +817,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
                 words.append(DetectedWord(
                     text: tokenStr,
-                    boundingBox: box.boundingBox,
+                    boundingBox: toFullFrame(box.boundingBox),
                     confidence: candidate.confidence,
                     context: fullText
                 ))
@@ -598,33 +829,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         return words
     }
 
-    // Downscale the frame and store it as a small JPEG for library thumbnails.
-    // Frame comes in rotated (.right); apply the same rotation so the saved
-    // image matches what the user sees on screen.
-    private func updateSnapshot(from pixelBuffer: CVPixelBuffer) {
-        // JPEG encoding is expensive — throttle it so it doesn't starve the
-        // capture pipeline (a frequent trigger of frame-flow stalls).
-        let now = Date()
-        guard now.timeIntervalSince(lastSnapshotTime) >= snapshotInterval else { return }
-        lastSnapshotTime = now
-
-        let ci = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-
-        // Target ~600px on the long side — plenty for a card, keeps storage small.
-        let extent = ci.extent
-        let maxSide = max(extent.width, extent.height)
-        guard maxSide > 0 else { return }
-        let scale = min(1.0, 600.0 / maxSide)
-        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-
-        guard let cg = ciContext.createCGImage(scaled, from: scaled.extent) else { return }
-        let data = UIImage(cgImage: cg).jpegData(compressionQuality: 0.6)
-
-        snapshotLock.lock()
-        lastSnapshot = data
-        snapshotLock.unlock()
-    }
-
     // Full-resolution still oriented like the preview (.right), for the freeze
     // overlay. Not downscaled — it fills the screen and must stay crisp.
     private func renderFullFrame(from pixelBuffer: CVPixelBuffer) -> UIImage? {
@@ -633,31 +837,142 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         return UIImage(cgImage: cg)
     }
 
-    // The index fingertip plus a unit vector along the finger's pointing
-    // direction (index MCP knuckle → tip). Direction lets us sample the word
-    // just past the NAIL instead of guessing the hand always enters from below.
+    // The index fingertip plus a unit vector along the finger's pointing direction
+    // (index MCP knuckle → tip). Direction lets us sample the word just past the NAIL
+    // instead of guessing the hand always enters from below.
+    //
+    // ANTI-MISDETECTION (the fix for "dot jumps to the thumb / a knuckle"):
+    // Vision emits a full 21-joint skeleton per hand, and when the pointing finger
+    // foreshortens toward the lens, or the hand is cropped at the frame edge, or
+    // several fingers bunch up, it MISLABELS joints — handing back a thumb tip or a
+    // knuckle tagged as `.indexTip` with a middling confidence. The old code took
+    // any point over 0.3, so it followed those bad labels. Now we:
+    //   1. Raise the tip confidence gate to 0.5 (the misdetections cluster low).
+    //   2. Require the finger to be ANATOMICALLY EXTENDED — tip farther from the
+    //      wrist than DIP, than PIP, than MCP (a straight pointing finger is
+    //      monotonic outward). A scrambled skeleton or a bent finger fails this and
+    //      the whole frame is rejected, so a mislabeled thumb never becomes the dot.
     private func fingerTip(from obs: VNHumanHandPoseObservation?) -> (tip: CGPoint, dir: CGVector)? {
         guard let obs else { return nil }
 
-        func point(_ joint: VNHumanHandPoseObservation.JointName) -> CGPoint? {
-            (try? obs.recognizedPoint(joint)).flatMap { $0.confidence > 0.3 ? $0.location : nil }
+        // Tip gate is 0.4 (was 0.5). A slightly-soft hand — the common case right
+        // after a focus change, and the reason the dot used to need "wave the phone
+        // to make it appear" — now clears the bar, so the dot shows sooner. The
+        // isExtended() anatomy check below stays the real anti-misdetection filter,
+        // so dropping the gate doesn't bring the thumb/knuckle false positives back.
+        func point(_ joint: VNHumanHandPoseObservation.JointName, _ minConf: Float = 0.4) -> CGPoint? {
+            (try? obs.recognizedPoint(joint)).flatMap { $0.confidence > minConf ? $0.location : nil }
         }
 
-        // Prefer the index finger; fall back to the middle finger if occluded.
-        if let tip = point(.indexTip) {
-            let base = point(.indexPIP) ?? point(.indexMCP)
+        // Wrist anchors the "is this finger extended?" test. Low gate — the wrist is
+        // usually easy to see and we only need a rough origin for the distance chain.
+        let wrist = point(.wrist, 0.3)
+
+        // True when tip→DIP→PIP→MCP get progressively closer to the wrist, i.e. the
+        // finger is straight and pointing — not a scrambled skeleton or a curled digit.
+        func isExtended(_ tip: CGPoint,
+                        _ dip: VNHumanHandPoseObservation.JointName,
+                        _ pip: VNHumanHandPoseObservation.JointName,
+                        _ mcp: VNHumanHandPoseObservation.JointName) -> Bool {
+            guard let wrist else { return true }   // no wrist → skip the test, don't over-reject
+            func dist(_ j: VNHumanHandPoseObservation.JointName) -> CGFloat? {
+                point(j, 0.3).map { hypot($0.x - wrist.x, $0.y - wrist.y) }
+            }
+            let dTip = hypot(tip.x - wrist.x, tip.y - wrist.y)
+            guard let dDip = dist(dip), let dPip = dist(pip), let dMcp = dist(mcp) else {
+                return true   // missing a joint → can't disprove; allow it
+            }
+            return dTip > dDip && dDip > dPip && dPip > dMcp
+        }
+
+        if let tip = point(.indexTip),
+           isExtended(tip, .indexDIP, .indexPIP, .indexMCP) {
+            let base = point(.indexPIP, 0.3) ?? point(.indexMCP, 0.3)
             return (tip, direction(from: base, to: tip))
         }
-        if let tip = point(.middleTip) {
-            let base = point(.middlePIP) ?? point(.middleMCP)
+        if let tip = point(.middleTip),
+           isExtended(tip, .middleDIP, .middlePIP, .middleMCP) {
+            let base = point(.middlePIP, 0.3) ?? point(.middleMCP, 0.3)
             return (tip, direction(from: base, to: tip))
         }
         return nil
     }
 
-    // Unit vector base → tip; falls back to "up the page" if the base joint is
-    // missing (Vision space, bottom-left origin, so pointing away from the hand
-    // that entered from the page bottom means +y).
+    // Smooths the raw fingertip and rejects teleport glitches. Returns the position
+    // the dot should show (nil = no reliable finger this frame). Processing-queue only.
+    private func updateSmoothedFinger(_ raw: CGPoint?) -> CGPoint? {
+        guard let raw else {
+            smoothedFinger = nil
+            fingerRejectStreak = 0
+            return nil
+        }
+        guard let prev = smoothedFinger else {
+            smoothedFinger = raw          // first sample — adopt as-is
+            fingerRejectStreak = 0
+            return raw
+        }
+        let jump = hypot(raw.x - prev.x, raw.y - prev.y)
+        if jump > fingerJumpReject {
+            // Looks like a teleport (likely a mislabeled joint). Hold the dot still,
+            // but if far samples keep coming it's a real fast move — accept then.
+            fingerRejectStreak += 1
+            if fingerRejectStreak < fingerRejectLimit {
+                return prev               // drop the glitch, keep the dot put
+            }
+            smoothedFinger = raw          // sustained move — snap to the new spot
+            fingerRejectStreak = 0
+            return raw
+        }
+        fingerRejectStreak = 0
+        // Exponential moving average — glide toward the raw sample.
+        let a = fingerSmoothing
+        let sm = CGPoint(x: prev.x * a + raw.x * (1 - a),
+                         y: prev.y * a + raw.y * (1 - a))
+        smoothedFinger = sm
+        return sm
+    }
+
+    // Update the stillness flag from the smoothed tip's frame-to-frame speed. Returns
+    // true when the finger is parked (below fingerStillSpeed). This is the intent gate:
+    // dwell only accrues while still, so a short hoverDuration can't fire on a sweep.
+    private func updateStillness(_ p: CGPoint?) -> Bool {
+        guard let p else {
+            lastStillSample = nil
+            lastStillAt = nil
+            fingerStill = false
+            return false
+        }
+        let now = Date()
+        defer { lastStillSample = p; lastStillAt = now }
+        guard let prev = lastStillSample, let prevAt = lastStillAt else {
+            // First sample — no speed yet. Treat as moving so a hand landing mid-sweep
+            // needs one settled frame before it can accrue.
+            fingerStill = false
+            return false
+        }
+        let dt = now.timeIntervalSince(prevAt)
+        guard dt > 0 else { return fingerStill }
+        let speed = hypot(p.x - prev.x, p.y - prev.y) / CGFloat(dt)
+        fingerStill = speed < fingerStillSpeed
+        return fingerStill
+    }
+
+    // EMA the pointing direction and renormalize. nil input (no finger) clears the
+    // filter so a new hand starts fresh. Keeps the projected probe from jittering.
+    private func updateSmoothedDir(_ raw: CGVector?) -> CGVector? {
+        guard let raw else { smoothedDir = nil; return nil }
+        guard let prev = smoothedDir else { smoothedDir = raw; return raw }
+        let a = dirSmoothing
+        var dx = prev.dx * a + raw.dx * (1 - a)
+        var dy = prev.dy * a + raw.dy * (1 - a)
+        let len = hypot(dx, dy)
+        if len > 0.0001 { dx /= len; dy /= len } else { dx = raw.dx; dy = raw.dy }
+        let sm = CGVector(dx: dx, dy: dy)
+        smoothedDir = sm
+        return sm
+    }
+
+    // Unit vector base → tip; falls back to "up the page" if the base joint is missing.
     private func direction(from base: CGPoint?, to tip: CGPoint) -> CGVector {
         guard let base else { return CGVector(dx: 0, dy: 1) }
         let dx = tip.x - base.x, dy = tip.y - base.y
@@ -666,125 +981,204 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         return CGVector(dx: dx / len, dy: dy / len)
     }
 
-    // Returns true once the fingertip has stayed within fingerStillTolerance for
-    // fingerStillDelay — i.e. the user is POINTING, not sweeping a pen along a
-    // line. A moving hand (drawing) or no hand returns false, which keeps mark
-    // detection alive. Processing-queue only.
-    private func updateFingerStillness(_ finger: CGPoint?) -> Bool {
-        guard let finger else {
-            lastFingerPoint = nil
-            fingerStillSince = nil
+    // Ignore the first fingerEntryMute seconds after a hand APPEARS, so a hand merely
+    // sweeping into frame can't instantly start accruing dwell on whatever word it
+    // passes over first. Returns true while still inside that mute window (dwell time
+    // is not accrued then). Processing-queue only.
+    private func updateEntryMute(_ finger: CGPoint?) -> Bool {
+        guard finger != nil else {
+            fingerFirstSeen = nil
             return false
         }
-        if let last = lastFingerPoint,
-           hypot(finger.x - last.x, finger.y - last.y) <= fingerStillTolerance {
-            // Still roughly in place — start / keep the stillness clock.
-            if fingerStillSince == nil { fingerStillSince = Date() }
-        } else {
-            // Moved beyond tolerance — the hand is traveling (drawing). Reset.
-            fingerStillSince = nil
-        }
-        lastFingerPoint = finger
-        guard let since = fingerStillSince else { return false }
-        return Date().timeIntervalSince(since) >= fingerStillDelay
+        let now = Date()
+        if fingerFirstSeen == nil { fingerFirstSeen = now }
+        guard let seen = fingerFirstSeen else { return false }
+        return now.timeIntervalSince(seen) < fingerEntryMute
     }
 
-    // All mutations here run on main thread.
+    // All mutations here run on the main thread.
     //
-    // Position-anchored confirmation: we don't care what OCR *calls* the word,
-    // only that the finger dwells over the same spot. This is robust to OCR
-    // string flicker, which was the main reason pointing never confirmed.
-    //
-    // `pointing` = the fingertip has actually STOPPED (held still for
-    // fingerStillDelay). A word is only promoted to the confirmed result while
-    // the finger is stopped ON it. Mid-travel — sweeping the hand toward the
-    // target — the word under the probe is exposed for prefetch but NEVER
-    // confirmed, so a word merely passed over on the way (e.g. "the") can't fire
-    // a result before the finger reaches where the user is actually aiming.
+    // DWELL AS AN ACCUMULATOR (the shaking-scenario fix). Instead of timing
+    // CONTINUOUS stillness — where any jitter frame, OCR text flicker, or dropped
+    // OCR result reset the clock and the fill snapped to 0 — progress ACCRUES per
+    // frame while the finger stays on roughly one target, and a brief finger/OCR
+    // dropout only PAUSES it (a grace window) rather than wiping it. A full reset
+    // happens only when the finger genuinely moves to a DIFFERENT word or leaves past
+    // the grace. Net: on a shaking bus the bar still fills after hoverDuration of
+    // cumulative good frames instead of climbing-and-resetting forever.
     private func updatePointedWord(finger: CGPoint?, dir: CGVector?,
-                                   words: [DetectedWord], pointing: Bool) {
+                                   words: [DetectedWord], withinEntryMute: Bool,
+                                   still: Bool) {
+        let now = Date()
+
+        // ── Hand pose dropped this frame ────────────────────────────────────────
         guard let finger else {
+            // Hold the dwell through a brief hand-pose dropout: a one/two-frame miss
+            // on shaky input shouldn't wipe accrued progress. Beyond the grace, clear.
+            if dwellAnchor != nil {
+                if fingerLostSince == nil { fingerLostSince = now }
+                if now.timeIntervalSince(fingerLostSince ?? now) <= fingerLostGrace {
+                    // Keep the dot PINNED at the committed spot through a brief
+                    // hand-pose dropout instead of nil-ing it. Nil-ing it made the dot
+                    // blink off/on every dropped frame on shaky input — the reported
+                    // "反复消失出现". Progress + word are held; accrual is paused.
+                    fingerProbePoint = dwellAnchor
+                    dwellLastTick = nil      // don't count the paused gap as dwell time
+                    return
+                }
+            }
             clearHover()
             return
         }
+        fingerLostSince = nil
 
-        // Sample the spot the NAIL points at: step just past the fingertip along
-        // the finger's own direction. This lands on the word being pointed at
-        // regardless of which side the hand comes from, instead of the old fixed
-        // "+y" guess that assumed the hand always enters from the page bottom.
+        // Sample the spot the NAIL points at: step just past the fingertip along the
+        // finger's own direction, so it lands on the pointed word regardless of which
+        // side the hand comes from.
         let d = dir ?? CGVector(dx: 0, dy: 1)
         let probe = CGPoint(
             x: min(max(finger.x + d.dx * fingerProjection, 0), 1),
             y: min(max(finger.y + d.dy * fingerProjection, 0), 1)
         )
 
-        // Pick the pointed word:
-        //   1. Prefer a word whose box actually CONTAINS the probe (the nail is
-        //      resting on it). If several overlap, take the smallest — the tight
-        //      match, never a big box that merely spans the area.
-        //   2. Otherwise fall back to the nearest word EDGE within fingerReach —
-        //      distance to the box, not its center, so a long word isn't lost to
-        //      a short neighbour just because its center is farther away.
-        let containing = words
-            .filter { $0.boundingBox.contains(probe) }
-            .min(by: { boxArea($0) < boxArea($1) })
+        // Is the probe still on the current dwell target? POSITION-based, so OCR text
+        // flicker at the same physical spot does NOT count as moving to a new target.
+        let onAnchor = dwellAnchor.map { hypot(probe.x - $0.x, probe.y - $0.y) < dwellAnchorTolerance } ?? false
 
-        let candidate: DetectedWord?
-        if let containing {
-            candidate = containing
-        } else {
-            let nearest = words.min(by: { edgeDistance(probe, to: $0) < edgeDistance(probe, to: $1) })
-            candidate = (nearest.map { edgeDistance(probe, to: $0) } ?? .greatestFiniteMagnitude) < fingerReach
-                ? nearest : nil
+        // PIN THE DOT once the finger has committed to a word. While on-anchor the dot
+        // is drawn at the fixed anchor, NOT the live probe — the probe micro-jitters
+        // every frame (the fingertip is EMA-smoothed but the pointing DIRECTION is
+        // recomputed raw each frame), which was the reported "小范围移动". Only a genuine
+        // move off the anchor lets the dot follow the probe again.
+        fingerProbePoint = onAnchor ? (dwellAnchor ?? probe) : probe
+
+        // Pick the pointed word by PROXIMITY to the probe (= where the green dot is).
+        //
+        // An earlier "intent" attempt selected the word closest to the pointing RAY, to
+        // disambiguate a finger between two words. It backfired: the hand-pose direction
+        // carries a lateral tilt, and ray-offset ignores distance ALONG the ray, so a word
+        // off to the (upper-)side that merely lined up with the tilt won over the word
+        // actually under the dot — the reported "经常识别右边词". Proximity is noisier in
+        // theory but matches the dot the user sees, so it's what we use.
+        //
+        // The probe can still OVERSHOOT into a neighbour on tight lines, so containment
+        // alone isn't enough: we also allow the nearest word within reach, then pick the
+        // candidate whose box CENTER is closest to the probe.
+        var candidates = words.filter { $0.boundingBox.contains(probe) }
+        if let nearest = words.min(by: { edgeDistance(probe, to: $0) < edgeDistance(probe, to: $1) }),
+           edgeDistance(probe, to: nearest) < fingerReach,
+           !candidates.contains(where: { $0.text == nearest.text && $0.boundingBox == nearest.boundingBox }) {
+            candidates.append(nearest)
         }
+        let candidate = candidates.min(by: {
+            centerDistance(probe, to: $0) < centerDistance(probe, to: $1)
+        })
 
+        // ── OCR produced no word at the probe this frame ────────────────────────
         guard let candidate else {
+            // Still hovering the same physical spot where we HAD a word → hold the
+            // dwell through the OCR dropout (grace) instead of resetting to 0.
+            if onAnchor, dwellWord != nil {
+                if candidateLostSince == nil { candidateLostSince = now }
+                if now.timeIntervalSince(candidateLostSince ?? now) <= candidateLostGrace {
+                    dwellLastTick = nil      // pause accrual during the dropout
+                    return
+                }
+            }
             clearHover()
             return
         }
+        candidateLostSince = nil
 
-        // Keep the anchor if the finger is still near where it started dwelling;
-        // otherwise (re)start the dwell timer at the new spot.
-        if let anchor = anchorPoint, hypot(probe.x - anchor.x, probe.y - anchor.y) < anchorTolerance {
-            // Still holding — publish hovering word for prefetch, confirm on dwell.
-            // Compare by text (ids regenerate each frame) to avoid needless publishes.
-            if hoveringWord?.text != candidate.text {
+        // Same target is POSITION-based: the probe is still within tolerance of the
+        // anchor. OCR text flicker at that spot (e.g. "the"↔"thc" between frames) must
+        // NOT reset the dwell — resetting on flicker was the reported "反复放大". So we
+        // stay in the accrue branch whenever on-anchor, and keep the anchor's ORIGINAL
+        // label stable rather than flip-flopping it with every OCR wobble.
+        if onAnchor || dwellWord == nil {
+            // First commit on this target: plant the anchor here so the dot pins from
+            // frame one and progress starts accruing immediately (no throwaway frame).
+            if dwellWord == nil {
+                dwellWord = candidate.text
+                dwellAnchor = probe
+                fingerProbePoint = probe
+            }
+            // Track the freshest candidate for the card/prefetch context, but only when
+            // it matches the committed label — a flicker to a different string is
+            // ignored so the dot's target stays put.
+            if hoveringWord?.text != candidate.text, candidate.text == dwellWord {
                 hoveringText = candidate.text
                 hoveringWord = candidate
+            } else if hoveringWord == nil {
+                hoveringText = dwellWord
+                hoveringWord = candidate
             }
-            // Confirm ONLY when the fingertip has actually stopped (pointing) AND
-            // has dwelled long enough. Without the `pointing` gate a word skimmed
-            // over while moving the hand toward the target would confirm early.
-            if pointing,
-               let start = anchorStart, Date().timeIntervalSince(start) >= hoverDuration,
-               pointedWord?.text != candidate.text {
-                pointedWord = candidate
+            // Accrue cumulative STILL-frame time. Two gates:
+            //   • entry mute — a hand just sweeping into frame doesn't count yet;
+            //   • stillness — progress accrues ONLY while the finger is parked. A finger
+            //     still gliding over the page racks up nothing, so hoverDuration can be
+            //     tiny (0.3s) without a moving sweep firing. When moving we PAUSE (null
+            //     the tick) so the gap isn't later counted as dwell, but we DON'T reset
+            //     accrued progress — a momentary jitter above threshold won't knock the
+            //     bar down, matching the anti-shake behaviour elsewhere.
+            if !withinEntryMute && still {
+                let last = dwellLastTick ?? now
+                let dt = min(max(now.timeIntervalSince(last), 0), dwellDtClamp)
+                dwellProgress = min(1, dwellProgress + dt / hoverDuration)
+                dwellLastTick = now
+            } else {
+                dwellLastTick = nil   // paused: don't count this gap toward dwell
+            }
+            setPointingProgress(dwellProgress)
+            // Confirm with the committed word (hoveringWord), falling back to the
+            // current candidate — never a flickered neighbour.
+            let locked = hoveringWord ?? candidate
+            if dwellProgress >= 1, pointedWord?.text != locked.text {
+                pointedWord = locked
             }
         } else {
-            // Moved to a new spot — reset dwell, expose for prefetch immediately.
-            anchorPoint = probe
-            anchorStart = Date()
+            // Finger genuinely moved to a DIFFERENT word / spot — restart the dwell.
+            dwellAnchor = probe
+            dwellWord = candidate.text
+            dwellProgress = 0
+            dwellLastTick = now
+            candidateLostSince = nil
+            fingerLostSince = nil
             hoveringText = candidate.text
             hoveringWord = candidate
             pointedWord = nil
+            setPointingProgress(0)
         }
+    }
+
+    // Only publishes when the value actually changes — the ring animates in the view,
+    // so a per-frame identical write would churn SwiftUI needlessly.
+    private func setPointingProgress(_ v: Double) {
+        if abs(pointingProgress - v) > 0.001 { pointingProgress = v }
     }
 
     private func clearHover() {
         hoveringText = nil
         hoveringWord = nil
-        anchorPoint = nil
-        anchorStart = nil
+        dwellProgress = 0
+        dwellLastTick = nil
+        dwellAnchor = nil
+        dwellWord = nil
+        candidateLostSince = nil
+        fingerLostSince = nil
         pointedWord = nil
+        fingerProbePoint = nil
+        setPointingProgress(0)
     }
 
-    private func boxArea(_ word: DetectedWord) -> CGFloat {
-        word.boundingBox.width * word.boundingBox.height
+    // Distance from a point to a word's box CENTER — the final tie-break among
+    // pointing candidates.
+    private func centerDistance(_ p: CGPoint, to word: DetectedWord) -> CGFloat {
+        let b = word.boundingBox
+        return hypot(b.midX - p.x, b.midY - p.y)
     }
 
     // Distance from a point to the NEAREST EDGE of a word's box (0 if inside).
-    // Center distance unfairly penalizes long words; edge distance reflects how
-    // close the nail actually is to the word.
     private func edgeDistance(_ p: CGPoint, to word: DetectedWord) -> CGFloat {
         let b = word.boundingBox
         let dx = max(b.minX - p.x, 0, p.x - b.maxX)
@@ -792,92 +1186,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         return hypot(dx, dy)
     }
 
-    // Match this frame's candidates to existing tracks by proximity, age the
-    // survivors, drop only tracks that have been gone longer than the grace
-    // window, then publish every track that has dwelled long enough. Handheld
-    // jitter (small box drift, one/two-frame dropouts) is absorbed, so a stable
-    // intent doesn't get reset or flicker.
-    private func updateColorMarks(_ candidates: [ColorMark]) {
-        let now = Date()
-
-        // 1. Match each candidate to the nearest same-type track within range,
-        //    updating that track's mark + lastSeen. Unmatched candidates spawn
-        //    new tracks. Each track matches at most one candidate per frame.
-        var used = Set<Int>()   // indices into trackedMarks already matched
-        for cand in candidates {
-            var bestIdx = -1
-            var bestDist = markMatchDistance
-            for (i, t) in trackedMarks.enumerated() where !used.contains(i) {
-                guard t.mark.markType == cand.markType else { continue }
-                let d = centerDistance(t.mark.boundingBox, cand.boundingBox)
-                if d < bestDist { bestDist = d; bestIdx = i }
-            }
-            if bestIdx >= 0 {
-                used.insert(bestIdx)
-                trackedMarks[bestIdx].mark = cand          // adopt latest geometry/words
-                trackedMarks[bestIdx].lastSeen = now
-            } else {
-                trackedMarks.append(TrackedMark(mark: cand, firstSeen: now, lastSeen: now))
-            }
-        }
-
-        // 2. Drop tracks unseen beyond the grace period (brief dropouts survive).
-        trackedMarks.removeAll { now.timeIntervalSince($0.lastSeen) > markGracePeriod }
-
-        // 3. Publish tracks that have persisted long enough. Still-settling
-        //    tracks keep the scanning pill lit but don't publish yet.
-        var stable: [ColorMark] = []
-        var confirming = false
-        for t in trackedMarks {
-            if now.timeIntervalSince(t.firstSeen) >= markStableDuration {
-                stable.append(t.mark)
-            } else {
-                confirming = true
-            }
-        }
-        anyMarkConfirming = confirming
-
-        // Avoid thrashing colorMarks (and downstream) when the stable set's
-        // identity is unchanged — compare by coarse position signature.
-        let newSig = stable.map { markSignature($0) }.sorted()
-        let oldSig = colorMarks.map { markSignature($0) }.sorted()
-        if newSig != oldSig { colorMarks = stable }
-    }
-
-    // Normalized center-to-center distance between two boxes.
-    private func centerDistance(_ a: CGRect, _ b: CGRect) -> CGFloat {
-        hypot(a.midX - b.midX, a.midY - b.midY)
-    }
-
-    // Coarse identity signature, ONLY for cheap set-equality of the published
-    // list (not for tracking). Rounded loosely so sub-grid jitter can't flip it.
-    private func markSignature(_ m: ColorMark) -> String {
-        let b = m.boundingBox
-        let gx = Int((b.midX * 12).rounded())
-        let gy = Int((b.midY * 12).rounded())
-        return "\(m.markType)@\(gx),\(gy)"
-    }
-
-    // Scanning = a target is detected but not yet confirmed:
-    //   • finger is hovering a word but hasn't been held long enough, or
-    //   • marks have been seen but aren't stable enough to publish yet.
-    // Drives the bottom "recognizing…" hint.
-    //
-    // Debounced so it doesn't flicker: the raw signal blinks between frames as
-    // OCR / mark detection jitters. Rising edge is immediate (feels responsive);
-    // falling edge waits scanningOffGrace so a one-frame dropout can't blink the
-    // pill out and let the idle hint flash in its place.
+    // Scanning = a word is under the finger but not yet held long enough to confirm.
+    // Debounced: rising edge immediate, falling edge waits scanningOffGrace.
     private func updateScanningState() {
-        let fingerConfirming = (hoveringText != nil && pointedWord == nil)
-        let rawScanning = fingerConfirming || anyMarkConfirming
+        let rawScanning = (hoveringText != nil && pointedWord == nil)
 
         if rawScanning {
-            // Confirming right now — show immediately, clear any pending off timer.
             scanningOffSince = nil
             if !isScanning { isScanning = true }
         } else if isScanning {
-            // Signal dropped. Hold the pill until it's been gone long enough,
-            // so brief OCR/mark gaps don't cause a swap with the idle hint.
             if scanningOffSince == nil { scanningOffSince = Date() }
             if let since = scanningOffSince,
                Date().timeIntervalSince(since) >= scanningOffGrace {

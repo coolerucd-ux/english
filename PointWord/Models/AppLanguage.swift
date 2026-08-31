@@ -291,18 +291,19 @@ enum AppLanguage: String, CaseIterable, Identifiable {
     }
 
     // Idle guidance shown when the camera is live but nothing is being pointed
-    // at yet — tells the user the core gestures (point, or aim at an underlined /
-    // circled word) so the screen never feels dead.
+    // at yet — teaches the one core gesture (point at a word and hold) so the
+    // screen never feels dead. Underline / circle recognition was removed, so the
+    // copy no longer mentions it.
     var pointHint: String {
         switch self {
-        case .zhHant: return "👆 用手指向單字，或對準劃線與圈選的單字"
-        case .zhHans: return "👆 用手指向单词，或对准划线与圈选的单词"
-        case .ko:     return "👆 단어를 가리키거나, 밑줄·동그라미 친 단어를 비춰 보세요"
-        case .ja:     return "👆 指でさすか、下線・丸で囲んだ単語をかざしてください"
-        case .fr:     return "👆 Pointez un mot, ou visez un mot souligné ou entouré"
-        case .es:     return "👆 Señala una palabra, o enfoca una subrayada o rodeada"
-        case .pt:     return "👆 Aponte, ou enquadre uma palavra sublinhada ou circulada"
-        case .it:     return "👆 Indica una parola, o inquadra una sottolineata o cerchiata"
+        case .zhHant: return "👆 用手指向想查的單字，停一下"
+        case .zhHans: return "👆 用手指向想查的单词，停一下"
+        case .ko:     return "👆 궁금한 단어를 손가락으로 가리키고 잠시 멈춰 보세요"
+        case .ja:     return "👆 調べたい単語を指でさして、少し止めてください"
+        case .fr:     return "👆 Pointez le mot voulu et maintenez un instant"
+        case .es:     return "👆 Señala la palabra y mantén un instante"
+        case .pt:     return "👆 Aponte para a palavra e segure um instante"
+        case .it:     return "👆 Indica la parola e tieni fermo un istante"
         }
     }
 
@@ -317,35 +318,6 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .es:     return "Reintentar"
         case .pt:     return "Tentar de novo"
         case .it:     return "Riprova"
-        }
-    }
-
-    // Shown over a frozen/stalled preview: the camera feed dropped (system
-    // interruption / resource reclaim). Title reads that it froze; the button
-    // taps a full recover.
-    var cameraStalledTitle: String {
-        switch self {
-        case .zhHant: return "相機畫面卡住了"
-        case .zhHans: return "相机画面卡住了"
-        case .ko:     return "카메라 화면이 멈췄어요"
-        case .ja:     return "カメラ映像が止まりました"
-        case .fr:     return "L'aperçu caméra s'est figé"
-        case .es:     return "La cámara se ha congelado"
-        case .pt:     return "A câmera travou"
-        case .it:     return "L'anteprima si è bloccata"
-        }
-    }
-
-    var cameraStalledButton: String {
-        switch self {
-        case .zhHant: return "點擊恢復"
-        case .zhHans: return "点击恢复"
-        case .ko:     return "탭하여 복구"
-        case .ja:     return "タップして復帰"
-        case .fr:     return "Toucher pour reprendre"
-        case .es:     return "Toca para recuperar"
-        case .pt:     return "Toque para recuperar"
-        case .it:     return "Tocca per riprendere"
         }
     }
 

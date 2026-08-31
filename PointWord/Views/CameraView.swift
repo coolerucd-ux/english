@@ -4,22 +4,32 @@ import UIKit
 import SwiftData
 
 struct CameraView: View {
-    @StateObject private var camera = CameraManager()
+    // camera is @Observable, so it's owned with @State (the WWDC23 pattern), NOT
+    // @StateObject. This is HALF the freeze fix: @Observable tracks reads per
+    // property, so this view re-evaluates only for the camera properties it actually
+    // reads — not on every one of the ~10 frame-pipeline mutations per second like
+    // the old @Published/ObservableObject did. aiService has no observed state the
+    // view reads, so it stays a plain StateObject.
+    @State private var camera = CameraManager()
     @StateObject private var aiService = AIService()
     @Environment(\.scenePhase) private var scenePhase
 
-    // Saved-word count for the top-right badge.
-    @Query private var saved: [SavedWord]
+    // NOTE — the saved-word count is NOT queried here anymore. It lives in the
+    // dedicated SavedBadgeLabel leaf view (bottom of this file). A @Query on THIS
+    // big view — next to the @Observable camera driving ~10 frame updates/sec —
+    // had its SwiftData store-change invalidation coalesced away, so the count
+    // only refreshed on relaunch. A tiny leaf whose body is purely the query
+    // refreshes on every save/remove. (This was the "数字不实时" bug.)
 
     // Learner's native language — drives AI explanation language and UI strings.
     @AppStorage("appLanguage") private var languageRaw = AppLanguage.deviceDefault.rawValue
     private var language: AppLanguage { AppLanguage(rawValue: languageRaw) ?? .zhHans }
 
-    // Words currently presented as cards (order = display order).
-    @State private var displayWords: [String] = []
-    // Which word is expanded as the big card. nil = all shown compact.
-    // Default after a multi-word hit is the first word (big), rest folded.
-    @State private var focusedWord: String? = nil
+    // The single word currently shown as a card. nil = no card up. Recognition is
+    // one-word-at-a-time: point, hold, get exactly one card. The old multi-word /
+    // folded-list design was removed with underline/circle detection — there is no
+    // longer any path that yields more than one target at once.
+    @State private var displayWord: String? = nil
     @State private var cardStates: [String: WordCardState] = [:]
     // Words whose answer is still streaming in — drives the typing cursor.
     @State private var streamingWords: Set<String> = []
@@ -30,11 +40,6 @@ struct CameraView: View {
     // the user closes it. This keeps the word on screen so they can read /
     // save it without the card jumping around.
     @State private var isLocked: Bool = false
-
-    // Boxes to outline green, frozen at lock time (vision space, bottom-left).
-    // Drawn over the frozen still so they never drift. Only the words that
-    // actually produced a card are included.
-    @State private var hitBoxes: [CGRect] = []
 
     // Top heart-flash animation shown when a word is newly saved.
     @State private var heartFlash: Bool = false
@@ -57,49 +62,89 @@ struct CameraView: View {
 
     private let hintVisibleDuration: TimeInterval = 5.0   // max time the onboarding hint stays up
 
-    // At most 5 cards on screen (1 primary + 4 secondary).
-    private let maxCards = 5
+    // On-screen diagnostic HUD (fps / word-count / finger / running). The freeze
+    // is fixed, so it's OFF — the top-left line no longer shows. Kept as a flag
+    // (not deleted) so it can be re-armed in one edit if a capture stall ever
+    // needs a self-diagnosing screenshot again.
+    private let showDiagnostics = false
+
+    // NOTE — the OTHER half of the freeze fix: this view holds NO cached screen
+    // geometry and reads NO global mutable state (UIScreen.main / UIApplication.shared)
+    // anywhere in its body. Those reads-during-body were the AttributeGraph cycle
+    // source on iOS 26; a previous attempt cached them via a hidden GeometryReader
+    // that WROTE @State the body then READ BACK — which is itself a layout feedback
+    // loop and did NOT clear the cycle. All chrome now positions with SwiftUI-native
+    // safe area + relative padding, so there is nothing for a cycle to form around.
 
     var body: some View {
+        // FULL-BLEED camera stack lives in .background so it does NOT inflate the
+        // layout the chrome measures against. THIS is what lets the badge and card
+        // use native safe-area + relative padding and STILL get real 20pt gutters
+        // on device — with NO UIScreen.main / UIApplication.shared reads anywhere in
+        // this body. Those global-state reads-during-layout were the AttributeGraph
+        // cycle source (attributes 9272 / 18784 in the logs; 9296 earlier). A
+        // .background full-bleed layer + native safe-area chrome removes them
+        // entirely, without the card going 靠边.
         ZStack {
-            cameraLayer
-            annotationLayer
-
-            // Recognition sweep — above the live page, below any result card.
-            scanLineView
-
             // Card overlay
             if showOverlay {
                 overlay
             }
 
             heartFlashView
-            scanningHintView
             idlePointHintView
-
-            // Camera feed stalled (system interruption / resource reclaim) — surface
-            // a visible, tappable recover instead of a silently dead screen. Sits
-            // above everything but the permission fallback. Auto-clears the instant
-            // frames resume (isStalled flips false in CameraManager).
-            if camera.isStalled && !camera.permissionDenied {
-                cameraStalledView
-            }
 
             // Camera permission denied — full-screen fallback with a route to Settings.
             if camera.permissionDenied {
                 CameraDeniedView(language: language)
             }
+
+            // Live diagnostic HUD — tiny, top-left, under the notch. Lets a single
+            // screenshot of a frozen state be self-diagnosing: fps>0 w>0 = camera &
+            // detection alive (UI-delivery bug); fps>0 w=0 = alive but not
+            // recognizing; fps=0 / frozen text = capture source truly dead. Toggle
+            // off by flipping showDiagnostics once the freeze is nailed.
+            if showDiagnostics && !camera.diagLine.isEmpty {
+                VStack {
+                    HStack {
+                        Text(camera.diagLine)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.black.opacity(0.55), in: Capsule())
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(.top, 60)
+                .padding(.leading, 14)
+                .allowsHitTesting(false)
+            }
         }
-        // Badge floats as an overlay — NOT a ZStack sibling — so toggling the
-        // result card inside the ZStack can never shift its position. The badge
-        // pins itself to the physical screen top and offsets by the real notch
-        // inset, so its vertical position is deterministic (no reliance on how
-        // SwiftUI resolves safe area under the full-screen camera layer).
-        .overlay { badge }
-        .animation(.easeInOut(duration: 0.2), value: camera.isScanning)
+        // Fill the safe area so .background (full bleed) and .overlay (safe-area
+        // corner) always have a frame to anchor to, even when no card/hint is up.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Live preview + finger/annotation dots + green sweep — all full-bleed.
+        // As a .background they fill the screen (each ignoresSafeArea) WITHOUT
+        // enlarging the foreground's layout, so the chrome above stays in the safe
+        // area natively. The annotation GeometryReader still measures the full
+        // screen here (ignoresSafeArea on this ZStack), so finger-dot coordinate
+        // mapping is unchanged.
+        .background {
+            ZStack {
+                cameraLayer
+                annotationLayer
+                scanLineView
+            }
+            .ignoresSafeArea()
+        }
+        // Badge pinned to the top-trailing SAFE-AREA corner natively — clears the
+        // notch/status bar with no manual inset math and no global reads, so its
+        // position is deterministic and unaffected by the card appearing.
+        .overlay(alignment: .topTrailing) { badge }
         .animation(.easeInOut(duration: 0.2), value: showOverlay)
         .animation(.easeInOut(duration: 0.35), value: hintVisible)
-        .animation(.easeInOut(duration: 0.25), value: camera.isStalled)
         .fullScreenCover(isPresented: $showLibrary) {
             LibraryView()
         }
@@ -107,8 +152,18 @@ struct CameraView: View {
             camera.requestPermissionAndStart()
             startHintSession()
             OfflineDictionary.shared.preload()   // warm the no-network fallback off the main thread
+            // Keep the screen awake while the recognition page is up. The single
+            // biggest cause of "left it on the desk, came back, camera is dead" was
+            // the display auto-dimming / the system throttling the app after minutes
+            // of no touches — which stalls the capture pipeline. A word scanner is
+            // used hands-off (finger on paper, not on glass), so the normal idle
+            // timer fights the core use case; disable it here and restore it on exit.
+            UIApplication.shared.isIdleTimerDisabled = true
         }
-        .onDisappear { camera.stop() }
+        .onDisappear {
+            camera.stop()
+            UIApplication.shared.isIdleTimerDisabled = false   // stop holding the screen awake
+        }
         .onChange(of: showLibrary) { open in
             if open {
                 // Library covers us full-screen → SwiftUI fires onDisappear and we
@@ -124,19 +179,48 @@ struct CameraView: View {
             }
         }
         .onChange(of: scenePhase) { phase in
-            // Re-check when coming back from Settings / the background — they may
-            // have granted access. The onboarding hint is NOT re-shown on resume;
-            // it appears only on a fresh cold launch (onAppear).
-            if phase == .active {
+            // Tell the manager whether we're the foreground app FIRST — its watchdog
+            // and restart paths use this to refuse startRunning() while backgrounded
+            // (iOS reports that as interruption reason=1,
+            // videoDeviceNotAvailableInBackground, and a restart there just re-hammers
+            // the shared camera server → the -17281 spam and permanent freeze).
+            camera.setForeground(phase == .active)
+
+            switch phase {
+            case .background:
+                // REAL background / swipe-kill → release the camera cleanly NOW,
+                // while we still get CPU. onDisappear does NOT reliably fire before
+                // iOS suspends a swipe-killed process, so the session would otherwise
+                // die WITH the process still holding the camera; mediaserverd then
+                // keeps a dead client connection and the NEXT launch collides with it
+                // (-17281 at startup → frozen). Stopping here guarantees clean
+                // release. Idempotent, so a later onDisappear stop() is harmless.
+                camera.stop()
+
+            case .active:
+                // WARM RESUME (app was alive in the background) or the foreground
+                // half of launch. @State survives in-process, so restore the user
+                // where they left off:
+                //   1. A card is up (isLocked) → keep it; the frozen still covers the
+                //      stopped session. (We must NOT dismiss — that destroys the state
+                //      the user wants back.)
+                //   2. Library open (showLibrary) → do nothing; the cover owns the
+                //      screen and the session stays stopped.
+                //   3. Live recognition → re-arm the session so scanning resumes.
+                if isLocked || showLibrary { return }
                 camera.requestPermissionAndStart()
-                // The live session restarts on resume, but a stale freeze would
-                // keep an old still pinned over it (frozen photo + dead card).
-                // Drop back to live scanning if we were locked.
-                if isLocked { dismiss() }
+
+            default:
+                // .inactive is TRANSIENT — Control Center, app-switcher peek, a
+                // notification banner, the launch hand-off. iOS interrupts the
+                // capture session itself and resumes it on its own; tearing it down
+                // and restarting here only churns start/stop and hammers the camera
+                // server. Do nothing and let the system own it. A real background
+                // trip always continues on to .background, which is handled above.
+                break
             }
         }
         .onChange(of: camera.pointedWord?.text) { _ in recompute() }
-        .onChange(of: camera.colorMarks) { _ in recompute() }
         .onChange(of: camera.hoveringWord?.text) { _ in prefetchHovered() }
         .onChange(of: camera.isPreviewLive) { live in if live { onPreviewLive() } }
     }
@@ -149,7 +233,7 @@ struct CameraView: View {
     // Live preview + the frozen still shown after a result locks.
     @ViewBuilder
     private var cameraLayer: some View {
-        CameraPreviewView(session: camera.session)
+        CameraPreviewView(session: camera.session, focusTarget: camera)
             .ignoresSafeArea()
 
         // Frozen still — shown once a result locks. Covers the live preview at
@@ -169,38 +253,47 @@ struct CameraView: View {
         GeometryReader { geo in
             let size = geo.size
 
-            // Green boxes. Mid-scan the view stays clean — none at all. After a
-            // lock we outline only the words that produced a card, drawn from
-            // coordinates frozen at lock time (over the frozen still), so they
-            // never drift with later OCR/hand movement.
-            if isLocked {
-                ForEach(Array(hitBoxes.enumerated()), id: \.offset) { _, box in
-                    let rect = visionRectToView(box, viewSize: size)
-                    RoundedRectangle(cornerRadius: 3)
-                        .stroke(Color.green, lineWidth: 2.5)
-                        .frame(width: max(rect.width, 20), height: max(rect.height, 14))
-                        .position(x: rect.midX, y: rect.midY)
-                        .transition(.opacity)
-                }
-            }
+            // No result outline. During scanning only the blue dot shows; on a
+            // successful lock only the word card appears. The old green box was
+            // removed at the user's request — on the frozen still it lagged a few
+            // handheld-jitter frames behind the OCR box and drifted off the word.
 
-            // Finger indicator dot — only while live (hidden once frozen).
-            if !isLocked, let fp = camera.fingerVisionPoint {
-                let pt = visionPointToView(fp, viewSize: size)
+            // Finger indicator — only while live (hidden once frozen). This is the
+            // SINGLE pointing indicator: just the blue dot, no ring, no green box,
+            // no glow (they read as competing markers). It is drawn at the PROBE
+            // point — the spot just above the nail that recognition actually reads
+            // — NOT the raw fingertip, so the dot the user sees sits on the exact
+            // word being recognized. That alignment is the fix for "I point here
+            // but it reads the word above". Falls back to the fingertip only if no
+            // probe has been computed yet (the very first frame a hand appears).
+            // The dot itself carries the lock feedback — it grows and brightens as
+            // the dwell fills, so one calm element shows both "here's the fingertip"
+            // and "locking in".
+            if !isLocked, let anchor = camera.fingerProbePoint ?? camera.fingerVisionPoint {
+                let pt = visionPointToView(anchor, viewSize: size)
+                let p = camera.pointingProgress
+                // The dot IS the lock feedback: it starts small and dim while the
+                // finger is only hovering, and grows + brightens as the dwell
+                // fills, so at full lock it's a clearly larger, solid dot — the
+                // "this word is locked" signal, no separate ring needed. Growth is
+                // pronounced (22→42pt, opacity 0.40→0.90) so the lock reads at a
+                // glance instead of the old subtle 12pt creep. Green #32f08c —
+                // same hue as the scan sweep, so the whole recognition UI is one color.
                 Circle()
-                    .fill(Color.blue.opacity(0.55))
-                    .frame(width: 22, height: 22)
+                    .fill(Color(red: 0.196, green: 0.941, blue: 0.549).opacity(0.40 + 0.50 * p))
+                    .frame(width: 22 + 20 * p, height: 22 + 20 * p)
                     .overlay(Circle().stroke(Color.white, lineWidth: 2))
                     .position(pt)
+                    .animation(.easeOut(duration: 0.12), value: p)
             }
         }
     }
 
-    // Top-right saved-word count badge. Pinned to the PHYSICAL screen rect and
-    // offset by the real safe-area insets read from the window — the same
-    // absolute approach the bottom card uses. Vertical/horizontal position is
-    // therefore deterministic and unaffected by the full-screen camera layer or
-    // by the result card appearing/disappearing.
+    // Top-right saved-word count badge. Positioned by the parent
+    // `.overlay(alignment: .topTrailing)`, which keeps it inside the safe area
+    // natively — so it clears the notch/status bar with NO UIScreen/UIApplication
+    // reads and NO manual inset math. The camera is a .background layer now, so it
+    // no longer inflates this chrome's layout; relative padding gives real gutters.
     private var badge: some View {
         Button {
             showLibrary = true
@@ -211,8 +304,9 @@ struct CameraView: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: 22, height: 22)
-                Text("\(saved.count)")
-                    .font(.system(size: 17, weight: .semibold))
+                // Leaf view — see SavedBadgeLabel. Owning the @Query here (on the
+                // big camera view) made the count refresh only on relaunch.
+                SavedBadgeLabel()
             }
             .foregroundColor(.white)
             .padding(.horizontal, 16)
@@ -220,14 +314,8 @@ struct CameraView: View {
             .glassCapsule(interactive: true)
             .environment(\.colorScheme, .dark)
         }
-        .padding(.top, screenInsets.top + 8)   // just below the notch / status bar
-        .padding(.trailing, 20)                // 20pt gutter from the right edge
-        .frame(
-            width: UIScreen.main.bounds.width,
-            height: UIScreen.main.bounds.height,
-            alignment: .topTrailing
-        )
-        .ignoresSafeArea()
+        .padding(.top, 8)             // just below the safe-area top (notch/status bar)
+        .padding(.trailing, 20)       // 20pt gutter from the right edge
     }
 
     // Top heart-flash — appears briefly when a word is saved.
@@ -245,27 +333,20 @@ struct CameraView: View {
         }
     }
 
-    // Bottom scanning hint with shimmer — while a target is being confirmed.
-    // Yields to the entry guidance hint while it's up: they share the bottom
-    // slot, and on a reading app the page is full of text so isScanning goes
-    // true almost immediately — if scanning won, the guidance hint would never
-    // get its window. The guidance hint is brief (a couple seconds), so ceding
-    // to it costs nothing.
-    @ViewBuilder
-    private var scanningHintView: some View {
-        if camera.isScanning && !showOverlay && !hintVisible {
-            ScanningHint(text: language.scanning)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 44)
-                .transition(.opacity)
-        }
-    }
+    // The bottom "正在识别" text pill was removed: it overlapped the scan light
+    // (both signaled "I'm recognizing") and sat exactly where the result card
+    // pops up, so it read as clutter. The blue scan sweep now carries that meaning
+    // on its own, and the finger dot carries the precise per-word feedback.
 
-    // Full-screen top→bottom sweep shown while recognizing, gone once a card is
-    // up. Same visibility gate as the scanning pill so the two appear together.
+    // Full-screen top→bottom GREEN sweep — the ambient "recognition mode is live"
+    // signal. It runs while the camera is actively looking (idle or scanning) but
+    // HIDES once a result card is up (showOverlay): recognition already succeeded,
+    // so a "still searching" animation behind the card is misleading clutter. Also
+    // hidden by the permission-denied fallback (no camera to scan). It sits below
+    // the result card in the ZStack.
     @ViewBuilder
     private var scanLineView: some View {
-        if camera.isScanning && !showOverlay {
+        if !camera.permissionDenied && !showOverlay {
             ScanLineView()
         }
     }
@@ -299,71 +380,14 @@ struct CameraView: View {
     }
 
     private var showOverlay: Bool {
-        !displayWords.isEmpty
-    }
-
-    // Frozen-feed recover affordance. When the watchdog reports the camera feed
-    // has stalled, the live preview is a dead still — nothing else on screen tells
-    // the user, and there's no way to force a recovery. This dims the frozen frame,
-    // says what happened, and offers a big tap target that fully rebuilds the
-    // session. It disappears on its own the moment frames resume.
-    @ViewBuilder
-    private var cameraStalledView: some View {
-        ZStack {
-            Color.black.opacity(0.55).ignoresSafeArea()
-            VStack(spacing: 18) {
-                Image(systemName: "arrow.triangle.2.circlepath.camera")
-                    .font(.system(size: 46))
-                    .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
-
-                Text(language.cameraStalledTitle)
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .multilineTextAlignment(.center)
-                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
-
-                Button {
-                    camera.forceRecover()
-                } label: {
-                    Text(language.cameraStalledButton)
-                        .font(.body.weight(.semibold))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 32)
-                        .padding(.vertical, 14)
-                        .glassProminentCapsule(tint: .white)
-                }
-            }
-            .padding(.horizontal, 40)
-        }
-        .transition(.opacity)
+        displayWord != nil
     }
 
     // MARK: - Result overlay
     //
-    // The card block floats at the bottom, inset from all edges.
-    //
-    // IMPORTANT: the full-screen camera preview (ignoresSafeArea) inflates the
-    // layout reference used by relative modifiers, so `.padding`/GeometryReader
-    // gave NO real gutters on device (they worked only in the sim, which has no
-    // camera). We therefore pin the width to an ABSOLUTE pixel value derived from
-    // the physical screen — immune to the camera layer, safe area, and parents.
-    private var cardBlockWidth: CGFloat {
-        UIScreen.main.bounds.width - 40   // 20pt gutter each side
-    }
-
-    // Real safe-area insets read straight from the key window. The full-screen
-    // camera preview (ignoresSafeArea) makes SwiftUI's own safe-area math
-    // unreliable in this ZStack — same reason cardBlockWidth is pinned to
-    // UIScreen — so overlays that must clear the notch / home indicator read
-    // the physical insets and lay out against them.
-    private var screenInsets: UIEdgeInsets {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }?.safeAreaInsets ?? .zero
-    }
-
+    // The card block floats at the bottom, inset 20pt from each side. Now that the
+    // camera is a .background layer (it no longer inflates this overlay's layout),
+    // native relative padding produces real gutters on device — no UIScreen read.
     private var overlay: some View {
         ZStack(alignment: .bottom) {
             // Tap outside to rescan.
@@ -375,41 +399,19 @@ struct CameraView: View {
                 cardBlock
                 rescanButton
             }
-            .frame(width: cardBlockWidth)      // absolute width → guaranteed gutters
+            .padding(.horizontal, 20)          // 20pt gutter each side
             .padding(.bottom, 20)              // match the 20pt left/right gutters
-            .ignoresSafeArea(edges: .bottom)
         }
         .transition(.opacity)
-        .animation(.spring(response: 0.35), value: displayWords)
+        .animation(.spring(response: 0.35), value: displayWord)
     }
 
-    // Card presentation has three shapes for a multi-word hit:
-    //   • one word            → just the big card.
-    //   • focusedWord set      → that word big, the rest folded away. Tapping the
-    //                            big card expands everyone into the compact list.
-    //   • focusedWord nil      → every word as a compact card. Tapping one focuses
-    //                            it (big) and folds the others.
+    // Exactly one word → exactly one card. The old multi-word focus/fold layout
+    // was removed with underline/circle detection.
     @ViewBuilder
     private var cardBlock: some View {
-        let words = Array(displayWords.prefix(maxCards))
-        if words.count == 1 {
-            card(for: words[0])
-        } else if let focus = focusedWord, words.contains(focus) {
-            // Focused: big card on top; tap it to expand all into compact cards.
-            card(for: focus)
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.35)) { focusedWord = nil }
-                }
-        } else {
-            // Expanded: all compact; tap one to focus it as the big card.
-            VStack(spacing: 10) {
-                ForEach(words, id: \.self) { word in
-                    card(for: word, compact: true)
-                        .onTapGesture {
-                            withAnimation(.spring(response: 0.35)) { focusedWord = word }
-                        }
-                }
-            }
+        if let word = displayWord {
+            card(for: word)
         }
     }
 
@@ -425,14 +427,14 @@ struct CameraView: View {
         }
     }
 
-    private func card(for word: String, compact: Bool = false) -> some View {
+    private func card(for word: String) -> some View {
         WordCardView(
             state: cardStates[word] ?? .loading(word),
             language: language,
-            compact: compact,
+            compact: false,
             snapshot: lockedSnapshot,
             isStreaming: streamingWords.contains(word),
-            onClose: compact ? nil : { dismiss() },
+            onClose: { dismiss() },
             onSaved: { triggerHeartFlash() },
             onRetry: { retry(word) }
         )
@@ -447,14 +449,12 @@ struct CameraView: View {
 
     // Close the current card and resume recognition.
     private func dismiss() {
-        displayWords = []
-        focusedWord = nil
+        displayWord = nil
         isLocked = false
-        hitBoxes = []
         camera.unfreeze()       // drop the still, resume live preview
-        camera.resetDetection() // clear stale pointed word / marks so the next
-                                // card comes from a FRESH finger hold, not the
-                                // leftover result that just closed
+        camera.resetDetection() // clear stale pointed word so the next card comes
+                                // from a FRESH finger hold, not the leftover result
+                                // that just closed
         // No hint here — the onboarding primer is shown only on first cold launch,
         // not every time a card closes.
     }
@@ -512,75 +512,39 @@ struct CameraView: View {
         }
     }
 
-    // MARK: - Trigger logic (finger priority > marks)
+    // MARK: - Trigger logic (finger pointing only)
 
     private func recompute() {
         // A card is on screen and locked — keep it until the user closes it.
         guard !isLocked else { return }
 
-        let targets = Array(targetWords().prefix(maxCards))
-        guard !targets.isEmpty else { return }
+        // Exactly one target: the finger-pointed word (or nothing).
+        guard let target = targetWord() else { return }
 
         // Lock onto this result and show it.
         isLocked = true
         hintVisible = false                         // a result is up → drop the onboarding hint
         camera.freeze()                             // freeze the live preview into a still
         lockedSnapshot = camera.currentSnapshot()   // freeze the page for the library card
-        displayWords = targets.map { $0.displayKey }
-        // Default: first word big, the rest folded (only matters for multi-word).
-        focusedWord = displayWords.first
+        displayWord = target.displayKey
 
-        // Green outline: exactly the words that produced a card (P1), from boxes
-        // frozen here at lock time so they sit on the still and never drift.
-        let boxes = targets.flatMap { $0.boxes }
-        withAnimation(.easeInOut(duration: 0.2)) { hitBoxes = boxes }
-
-        for t in targets where cardStates[t.displayKey] == nil {
-            lookup(t)
+        if cardStates[target.displayKey] == nil {
+            lookup(target)
         }
     }
 
-    // One thing to look up: a single word, or a marked phrase treated as a unit.
+    // One thing to look up: the finger-pointed word.
     private struct QueryUnit {
-        let displayKey: String   // card title + state key (the phrase, or the word)
+        let displayKey: String   // card title + state key
         let term: String         // what we send to AI
-        let longestWord: String  // phrase's phonetic anchor
-        let isPhrase: Bool
         let context: String
-        let boxes: [CGRect]      // vision-space boxes of the covered word(s), for the green outline
     }
 
-    // Priority: finger-pointed word first; otherwise all marked words/phrases.
-    // A mark spanning >1 word is looked up as a whole phrase.
-    private func targetWords() -> [QueryUnit] {
-        if let w = camera.pointedWord, !w.text.isEmpty {
-            return [QueryUnit(displayKey: w.text, term: w.text,
-                              longestWord: w.text, isPhrase: false, context: w.context,
-                              boxes: [w.boundingBox])]
-        }
-        var seen = Set<String>()
-        var result: [QueryUnit] = []
-        for mark in camera.colorMarks {
-            guard let d = mark.primaryDetected else { continue }
-            if mark.isPhrase {
-                // Whole underlined/circled phrase → one query for its overall meaning.
-                let phrase = mark.phraseText
-                let dedupe = phrase.lowercased()
-                guard !phrase.isEmpty, !seen.contains(dedupe) else { continue }
-                seen.insert(dedupe)
-                result.append(QueryUnit(displayKey: phrase, term: phrase,
-                                        longestWord: d.text, isPhrase: true, context: phrase,
-                                        boxes: mark.words.map { $0.boundingBox }))
-            } else {
-                let w = d.text
-                guard !w.isEmpty, !seen.contains(w.lowercased()) else { continue }
-                seen.insert(w.lowercased())
-                result.append(QueryUnit(displayKey: w, term: w,
-                                        longestWord: w, isPhrase: false, context: d.context,
-                                        boxes: [d.boundingBox]))
-            }
-        }
-        return result
+    // The finger-pointed word, if any. Underline / circle detection was removed,
+    // so pointing is the only path to a result — always at most one word.
+    private func targetWord() -> QueryUnit? {
+        guard let w = camera.pointedWord, !w.text.isEmpty else { return nil }
+        return QueryUnit(displayKey: w.text, term: w.text, context: w.context)
     }
 
     // MARK: - AI Lookup
@@ -590,9 +554,7 @@ struct CameraView: View {
     // so it appears instantly instead of after a spinner.
     private func prefetchHovered() {
         guard !isLocked, let w = camera.hoveringWord, !w.text.isEmpty else { return }
-        lookup(QueryUnit(displayKey: w.text, term: w.text,
-                         longestWord: w.text, isPhrase: false, context: w.context,
-                         boxes: [w.boundingBox]))
+        lookup(QueryUnit(displayKey: w.text, term: w.text, context: w.context))
     }
 
     private func lookup(_ unit: QueryUnit) {
@@ -610,22 +572,21 @@ struct CameraView: View {
             await MainActor.run { streamingWords.insert(key) }
             do {
                 // Consume partial results as they stream in — the card types them out.
+                // Always a single pointed word now (marks removed), so isPhrase=false
+                // and the phonetic anchor is the word itself.
                 for try await partial in aiService.streamLookup(
                     unit.term, context: unit.context, language: lang,
-                    isPhrase: unit.isPhrase, phoneticWord: unit.longestWord
+                    isPhrase: false, phoneticWord: unit.term
                 ) {
                     await MainActor.run { cardStates[key] = .loaded(partial) }
                 }
             } catch {
                 await MainActor.run {
                     // Network/AI failed. Before showing a dead "retry" card, try the
-                    // bundled offline dictionary — the subway safety net. Only for
-                    // single words (a marked phrase is an AI whole-phrase
-                    // translation the offline word list can't reproduce), and only
-                    // if we haven't already streamed a partial answer in.
+                    // bundled offline dictionary — the subway safety net. Only if we
+                    // haven't already streamed a partial answer in.
                     if case .loading = cardStates[key] ?? .loading(key) {
-                        if !unit.isPhrase,
-                           let offline = OfflineDictionary.shared.lookup(unit.term, language: lang) {
+                        if let offline = OfflineDictionary.shared.lookup(unit.term, language: lang) {
                             cardStates[key] = .loaded(offline)
                         } else {
                             cardStates[key] = .failed(key)
@@ -646,18 +607,6 @@ struct CameraView: View {
 
     private let imageSize = CGSize(width: 720, height: 1280)
 
-    private func visionRectToView(_ rect: CGRect, viewSize: CGSize) -> CGRect {
-        let scale = max(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
-        let cropX = (imageSize.width * scale - viewSize.width) / 2
-        let cropY = (imageSize.height * scale - viewSize.height) / 2
-
-        let x = rect.minX * imageSize.width * scale - cropX
-        let y = (1 - rect.maxY) * imageSize.height * scale - cropY
-        let w = rect.width * imageSize.width * scale
-        let h = rect.height * imageSize.height * scale
-        return CGRect(x: x, y: y, width: w, height: h)
-    }
-
     private func visionPointToView(_ point: CGPoint, viewSize: CGSize) -> CGPoint {
         let scale = max(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
         let cropX = (imageSize.width * scale - viewSize.width) / 2
@@ -672,6 +621,9 @@ struct CameraView: View {
 // UIViewRepresentable wrapper for AVCaptureVideoPreviewLayer.
 struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
+    // The manager borrows this layer to convert a Vision point → device focus point
+    // (captureDevicePointConverted). weak on its side; we just hand it the reference.
+    weak var focusTarget: CameraManager?
 
     func makeUIView(context: Context) -> PreviewUIView {
         let view = PreviewUIView()
@@ -688,6 +640,7 @@ struct CameraPreviewView: UIViewRepresentable {
         }
         view.layer.addSublayer(layer)
         view.previewLayer = layer
+        focusTarget?.previewLayer = layer
         return view
     }
 
@@ -744,102 +697,141 @@ struct CameraDeniedView: View {
     }
 }
 
-// A horizontal glow band that sweeps top→bottom on repeat while a target is
-// being recognized. Purely decorative feedback ("something is happening"); it
-// carries no layout and ignores touches. Shown while scanning, gone the instant
-// a card appears. Kept restrained — a thin white line with a soft falloff — so
-// it reads as a clean sweep over the page, not a gamer HUD.
-struct ScanLineView: View {
-    @State private var phase: CGFloat = 0
+// The saved-word count for the top-right badge, isolated in its own leaf view.
+//
+// WHY A SEPARATE VIEW: when this @Query lived on CameraView, the count only
+// refreshed when the app relaunched — tapping ♥ to save/unsave did nothing to it
+// live. CameraView is a very large view whose body also depends on the
+// @Observable CameraManager, which mutates ~10×/sec from the frame pipeline.
+// SwiftData delivers its store-change invalidation to @Query, but on a host view
+// that heavy, SwiftUI coalesced the count's update away between the constant
+// camera-driven re-evaluations, so the displayed number went stale until the
+// view tree was rebuilt (relaunch). A leaf whose ENTIRE body is just this query
+// has nothing to coalesce against, so every insert/delete redraws it at once.
+private struct SavedBadgeLabel: View {
+    @Query private var saved: [SavedWord]
 
-    // Height of the soft glow tail. The band travels one full screen + this.
-    private let bandHeight: CGFloat = 80
+    var body: some View {
+        Text("\(saved.count)")
+            .font(.system(size: 17, weight: .semibold))
+    }
+}
+
+// A horizontal glow band that sweeps top→bottom on repeat while the recognition
+// screen is up. Purely decorative feedback ("recognition mode is live"); it
+// carries no layout and ignores touches. Design notes:
+//   • GREEN (#32f08c), the brand recognition accent.
+//   • The LEADING (bottom) edge is a crisp green line — kept sharp, no blur, no
+//     drop shadow — with a soft glow TRAILING upward behind it. So it reads as a
+//     clean light front gliding down the page, not a fuzzy blob with halos.
+//   • Spans the full screen width, feathered at the left/right ends.
+//   • Travels from 30% to 85% down the screen (over the reading area).
+//   • Fades IN at the top and OUT near the bottom so each pass ends softly
+//     instead of decelerating and hard-snapping back to the top.
+//
+// The sweep is driven by TimelineView(.animation), NOT a withAnimation state
+// tween. Reason: the fade in/out is a piecewise (non-monotonic) function of the
+// pass progress, so a single 0→1 state interpolation can't reproduce it — the
+// body only re-evaluates at the animation's END. TimelineView re-evaluates every
+// frame, so BOTH the position and the fade track the same time-derived phase.
+struct ScanLineView: View {
+    // One full pass, in seconds. The fade windows below are fractions of this.
+    private let period: Double = 2.5
+
+    // #32f08c — the green recognition accent.
+    private let glow = Color(red: 0.196, green: 0.941, blue: 0.549)
+
+    // Trailing glow height above the crisp leading edge. Kept shorter so the
+    // upward glow is a light, quick falloff — not a heavy column of green.
+    private let bandHeight: CGFloat = 150
 
     var body: some View {
         GeometryReader { geo in
+            let w = geo.size.width
             let h = geo.size.height
-            // The moving band: a fine bright hairline riding a soft white gradient
-            // tail so it looks like light gliding down the page, not a hard rule.
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        .clear,
-                        Color.white.opacity(0.10),
-                        Color.white.opacity(0.55),
-                        .clear
-                    ],
-                    startPoint: .top, endPoint: .bottom
-                )
-                .frame(height: bandHeight)
-                // Fine bright core line for a crisp leading edge.
-                Rectangle()
-                    .fill(Color.white.opacity(0.9))
-                    .frame(height: 0.75)
-                    .shadow(color: .white.opacity(0.5), radius: 3)
+
+            TimelineView(.animation) { timeline in
+                // phase 0→1 over `period`, looping. Derived from wall-clock time so
+                // the motion is steady (linear) and the fade can be a free function
+                // of it rather than a state tween.
+                let t = timeline.date.timeIntervalSinceReferenceDate
+                let phase = CGFloat((t.truncatingRemainder(dividingBy: period)) / period)
+
+                // Leading (bright, sharp) edge travels from 30% top → 85% (15% from
+                // the bottom).
+                let leadingY = h * 0.30 + phase * (h * 0.55)
+
+                // Fade IN over the first 12% of the pass, OUT over the last 18%, so
+                // each loop appears at the top and vanishes before it snaps back —
+                // no lingering, no hard reset ("最后消失有点慢/生硬").
+                let sweepOpacity = min(phase / 0.12, (1 - phase) / 0.18, 1)
+
+                ZStack {
+                    // A very light focus vignette: darkens the far edges a touch so
+                    // attention settles toward the center of the page. Kept
+                    // restrained (edges only to ~0.13) to preserve the 留白 calm — a
+                    // focus cue, never a heavy frame. It rides the parent's opacity
+                    // transition in/out with the sweep.
+                    RadialGradient(
+                        colors: [.clear, .clear, Color.black.opacity(0.13)],
+                        center: .center,
+                        startRadius: h * 0.18,
+                        endRadius: h * 0.72
+                    )
+
+                    // The green sweep: a soft glow trailing UPWARD, capped by a
+                    // crisp green leading line at the bottom. No blur / no shadow,
+                    // so the bottom edge stays sharp and nothing bleeds above/below.
+                    ZStack(alignment: .bottom) {
+                        // Soft trailing glow — transparent at the top, building to
+                        // the leading edge. Lighter ramp so the upper half of the
+                        // sweep isn't a heavy green block; the light lives mostly
+                        // near the crisp line. All stops here are 30% lighter than
+                        // before (×0.7) so the sweep recedes and the finger's green
+                        // dot reads as the brightest thing on screen.
+                        LinearGradient(
+                            colors: [
+                                .clear,
+                                glow.opacity(0.042),
+                                glow.opacity(0.154),
+                                glow.opacity(0.35)
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .frame(height: bandHeight)
+
+                        // Crisp leading edge — a clean 1px green line, full width,
+                        // no shadow. This is the "下边缘保持清晰" front of the sweep.
+                        // Opacity also dropped 30% (0.95→0.665) to sit behind the dot.
+                        Rectangle()
+                            .fill(glow.opacity(0.665))
+                            .frame(height: 1)
+                    }
+                    .frame(width: w, height: bandHeight)
+                    // Soft horizontal fade so the band doesn't end in hard vertical
+                    // edges — full-strength across the middle 70%, feathering in the
+                    // outer ~15% each side, so it still reaches the screen edges but
+                    // the ends read soft, not cut.
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.0),
+                                .init(color: .white, location: 0.15),
+                                .init(color: .white, location: 0.85),
+                                .init(color: .clear, location: 1.0)
+                            ],
+                            startPoint: .leading, endPoint: .trailing
+                        )
+                    )
+                    // Anchor the band's BOTTOM (the crisp line) at leadingY.
+                    .position(x: w / 2, y: leadingY - bandHeight / 2)
+                    .opacity(sweepOpacity)
+                }
             }
-            // Travel from just above the top edge to just past the bottom.
-            .offset(y: phase * (h + bandHeight) - bandHeight / 2)
-            .frame(width: geo.size.width)
         }
         .allowsHitTesting(false)
         .ignoresSafeArea()
         .transition(.opacity)
-        .onAppear {
-            phase = 0
-            withAnimation(.easeInOut(duration: 3.0).repeatForever(autoreverses: false)) {
-                phase = 1
-            }
-        }
-    }
-}
-
-// Bottom "recognizing…" pill. The text sits dim, and a bright highlight sweeps
-// left→right through the letters themselves — the common AI-loading shimmer.
-// The base text is hidden (reserves layout only); the ONLY visible glyphs are
-// the single masked layer in the overlay, so nothing can overlap / ghost.
-struct ScanningHint: View {
-    let text: String
-    @State private var phase: CGFloat = -1
-
-    private let font: Font = .subheadline.weight(.medium)
-
-    var body: some View {
-        Text(text)
-            .font(font)
-            .hidden()                 // reserves size; draws nothing
-            .overlay { shimmer }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-            .glassCapsule()
-            .environment(\.colorScheme, .dark)
-            .onAppear {
-                withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) {
-                    phase = 1
-                }
-            }
-    }
-
-    // Dim base + a bright band sweeping across, the whole thing clipped to the
-    // glyph shapes so the light travels through the letters. One layer only.
-    private var shimmer: some View {
-        GeometryReader { geo in
-            let w = geo.size.width
-            ZStack {
-                Color.white.opacity(0.35)          // dim base tone
-                LinearGradient(
-                    colors: [.clear, .white, .white, .clear],
-                    startPoint: .leading, endPoint: .trailing
-                )
-                .frame(width: w * 0.55)
-                .offset(x: phase * w * 1.4)         // slides off-screen at both ends
-            }
-            .mask(
-                Text(text)
-                    .font(font)
-                    .frame(width: w, height: geo.size.height)
-            )
-        }
-        .allowsHitTesting(false)
     }
 }
 

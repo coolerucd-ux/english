@@ -1,18 +1,18 @@
 import Foundation
 
-// Region-aware backend routing.
+// Region-aware backend routing — DIRECT to DashScope (Aliyun Tongyi).
 //
-// The app never holds the DashScope API key. It talks to a thin HTTP proxy that
-// injects the key server-side. We run (or plan to run) two proxies so users hit
-// a nearby endpoint instead of crossing borders:
+// The app now calls DashScope's OpenAI-compatible endpoint DIRECTLY; the Aliyun
+// Function Compute proxy was removed to cut cost. Trade-offs accepted for this:
+//   • The API key ships INSIDE the app (see dashScopeAPIKey). An app binary can
+//     be reverse-engineered, so treat this key as semi-public: set a hard
+//     SPENDING CAP / daily quota on it in the DashScope console so a leak can't
+//     run up an unbounded bill. There is no server, so PER-USER limits are not
+//     possible here — only account-level caps.
 //
-//   • China   → Aliyun Function Compute (Hangzhou)   — fast inside the mainland
-//   • Overseas → Cloudflare Worker (global edge)      — fast everywhere else
-//
-// Routing is decided by the DEVICE REGION (Settings › General › Language & Region),
-// not the in-app language. A Chinese speaker living abroad still gets the nearby
-// overseas edge; a French visitor in China still routes overseas. Region is a
-// stable per-device setting, so this is the reliable signal.
+// DashScope has two OpenAI-compatible hosts; we pick the nearer one by DEVICE
+// REGION (Settings › General › Language & Region), not the in-app language, so a
+// Chinese speaker abroad still hits the fast nearby host and vice-versa.
 enum AppRegion {
     case china
     case overseas
@@ -22,28 +22,28 @@ enum AppRegion {
         return .overseas
     }
 
-    // The proxy this region should talk to.
-    var apiProxyURL: String {
+    // DashScope OpenAI-compatible chat/completions endpoint for this region.
+    var apiURL: String {
         switch self {
         case .china:
-            return "https://pointword-api-tjsevsqlrr.cn-hangzhou.fcapp.run"
+            return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
         case .overseas:
-            // TODO: deploy the Cloudflare Worker, then paste its URL here, e.g.
-            //   https://pointword.<your-subdomain>.workers.dev
-            // Until then we fall back to the China endpoint so overseas users are
-            // never fully broken — just slower.
-            return "https://pointword-api-tjsevsqlrr.cn-hangzhou.fcapp.run"
+            // Singapore host — lower latency for users outside the mainland.
+            return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
         }
     }
 }
 
 enum Config {
-    // Resolved once per launch from the device region. Everything (AIService,
-    // the network probe) reads this single value, so switching endpoints is one
-    // edit in AppRegion above.
-    static let apiProxyURL = AppRegion.current.apiProxyURL
+    // Resolved once per launch from the device region.
+    static let apiURL = AppRegion.current.apiURL
 
-    // Optional shared secret. Leave empty unless you set APP_SHARED_SECRET on the
-    // proxy; if set, it must match the function's env var exactly.
-    static let appSharedSecret = ""
+    // DashScope API key. PASTE YOUR KEY HERE (starts with "sk-").
+    // ⚠️ This ships in the app binary — set a daily quota / spend cap on this key
+    // in the DashScope console (Model Studio) so a leak can't run up the bill.
+    static let dashScopeAPIKey = "sk-PASTE-YOUR-KEY-HERE"
+
+    // The model the proxy used to lock server-side. qwen-plus balances quality and
+    // cost; switch to qwen-turbo for cheaper/faster or qwen-max for best quality.
+    static let model = "qwen-plus"
 }

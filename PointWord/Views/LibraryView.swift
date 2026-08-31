@@ -10,6 +10,10 @@ struct LibraryView: View {
     private var language: AppLanguage { AppLanguage(rawValue: languageRaw) ?? .zhHans }
 
     @State private var showLanguagePicker = false
+    // The saved word whose detail sheet is up. Non-nil → the detail slides up from
+    // the bottom (a .sheet), replacing the old push-navigation. Driving it off the
+    // item (not a Bool) means the sheet always renders the tapped word.
+    @State private var detailItem: SavedWord? = nil
 
     // Fixed 3-per-row album — kept simple, no density switching.
     private let columns = 3
@@ -30,26 +34,47 @@ struct LibraryView: View {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 18, weight: .semibold))
+                        // Lucide chevron-left (was the SF Symbol chevron.left). All
+                        // header chrome icons — back, globe, close — are the SAME
+                        // Lucide set: stroke-width 2, drawn at 28×28, so their line
+                        // weight and size read identically. An SF Symbol here used a
+                        // different stroke model and never matched.
+                        Image("IconChevronLeft")
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 28, height: 28)
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showLanguagePicker = true
                     } label: {
-                        // Lucide globe asset, sized to match the back chevron so
+                        // Lucide globe asset, 28×28 — matches the back chevron so
                         // both header glyphs read as one set.
                         Image("IconGlobe")
                             .renderingMode(.template)
                             .resizable()
                             .scaledToFit()
-                            .frame(width: 20, height: 20)
+                            .frame(width: 28, height: 28)
                     }
                 }
             }
             .sheet(isPresented: $showLanguagePicker) {
                 languagePicker
+            }
+            // Detail slides up from the bottom instead of pushing in. Full-height
+            // so the letterboxed page + floating card have the same room they had
+            // as a pushed screen. The visible drag indicator is the native cue that
+            // this panel dismisses by dragging down — the standard iOS sheet feel.
+            // Inside, a paged TabView lets the user swipe left/right through the
+            // whole saved list without leaving the sheet, starting on the word they
+            // tapped.
+            .sheet(item: $detailItem) { item in
+                WordDetailPager(words: savedWords, current: item, language: language)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                    .presentationCornerRadius(28)
             }
         }
     }
@@ -73,8 +98,8 @@ struct LibraryView: View {
                 spacing: spacing
             ) {
                 ForEach(savedWords) { item in
-                    NavigationLink {
-                        WordDetailView(item: item, language: language)
+                    Button {
+                        detailItem = item
                     } label: {
                         WordAlbumCard(item: item)
                     }
@@ -82,6 +107,7 @@ struct LibraryView: View {
                     .contextMenu {
                         Button(role: .destructive) {
                             context.delete(item)
+                            try? context.save()   // persist now so other @Query views (camera badge) update live
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
@@ -204,6 +230,61 @@ private struct WordAlbumCard: View {
     }
 }
 
+// MARK: - Word detail pager
+
+// Hosts the swipeable detail. A paged TabView lets the user flick left/right
+// through the entire saved list without popping back to the grid; it opens on
+// the tapped word. The close button lives HERE (not inside each page) so it
+// stays pinned while the pages slide underneath.
+private struct WordDetailPager: View {
+    let words: [SavedWord]
+    let current: SavedWord
+    let language: AppLanguage
+    @Environment(\.dismiss) private var dismiss
+
+    // Which page is showing, tracked by the word's stable SwiftData id so the
+    // binding survives list reordering (e.g. a word saved/removed elsewhere).
+    @State private var selection: PersistentIdentifier
+
+    init(words: [SavedWord], current: SavedWord, language: AppLanguage) {
+        self.words = words
+        self.current = current
+        self.language = language
+        _selection = State(initialValue: current.persistentModelID)
+    }
+
+    var body: some View {
+        TabView(selection: $selection) {
+            ForEach(words) { item in
+                WordDetailView(item: item, language: language)
+                    .tag(item.persistentModelID)
+            }
+        }
+        // Horizontal paging with no index dots — the swipe itself is the cue, and
+        // dots over a photo would clutter the clean look.
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        // Close button, top-left. Pinned at the pager level so it holds still while
+        // pages slide. Same glassCapsule chrome + 28×28 glyph as the library header.
+        .overlay(alignment: .topLeading) {
+            Button {
+                dismiss()
+            } label: {
+                Image("IconClose")
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 28, height: 28)
+                    .foregroundColor(.white)
+                    .padding(9)
+                    .glassCapsule(interactive: true)
+                    .environment(\.colorScheme, .dark)
+            }
+            .padding(.top, 12)
+            .padding(.leading, 16)
+        }
+    }
+}
+
 // MARK: - Word detail
 
 // Tapping an album tile opens this. It rebuilds the recognition result from the
@@ -245,33 +326,32 @@ private struct WordDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.black)
-            .ignoresSafeArea()
+            // Bleed to the bottom/sides only. Leaving the TOP safe area alone keeps
+            // the sheet's rounded corners + drag handle visible instead of a hard
+            // black rectangle covering them — that flat full-bleed black was what
+            // broke the native sheet look.
+            .ignoresSafeArea(edges: [.bottom, .horizontal])
 
-            // Floating bottom block: just the word card, docked to the bottom —
-            // same 20pt gutters as the camera page. The save time now lives in the
-            // nav bar as a subtitle, so nothing competes with the card down here.
-            WordCardView(
-                state: .loaded(explanation),
-                language: language,
-                onRemoved: { dismiss() }
-            )
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
-        }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            // Word as the title with the second-precision save time as a subtitle
-            // stacked beneath it — a quiet timestamp that never covers the card.
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    Text(item.word)
-                        .font(.headline)
-                        .foregroundColor(.white)
-                    Text(Self.stamp.string(from: item.createdAt))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.6))
-                }
+            // Floating bottom block: the word card, then the save time centered
+            // just BELOW it. The timestamp reads as a quiet caption tucked under
+            // the card — clear of the photo seam, centered in the gutter.
+            VStack(spacing: 10) {
+                WordCardView(
+                    state: .loaded(explanation),
+                    language: language,
+                    onRemoved: { dismiss() }
+                )
+
+                Text(Self.stamp.string(from: item.createdAt))
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.9))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .glassCapsule()
+                    .environment(\.colorScheme, .dark)
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
         }
     }
 

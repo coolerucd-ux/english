@@ -105,23 +105,30 @@ class AIService: ObservableObject {
         phoneticWord: String,
         onPartial: @escaping (WordExplanation) -> Void
     ) async throws -> WordExplanation {
-        // Talk to our proxy, not DashScope directly — the API key stays
-        // server-side. Model and max_tokens are locked by the proxy, so we only
-        // send the messages.
-        guard let url = URL(string: Config.apiProxyURL) else {
+        // Talk to DashScope's OpenAI-compatible endpoint DIRECTLY (the Aliyun
+        // Function Compute proxy was removed to cut cost). The API key ships in the
+        // app — see Config for the spend-cap caveat. We send model + stream + the
+        // messages ourselves now, since there's no proxy to lock them server-side.
+        guard let url = URL(string: Config.apiURL) else {
             throw URLError(.badURL)
         }
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !Config.appSharedSecret.isEmpty {
-            req.setValue(Config.appSharedSecret, forHTTPHeaderField: "x-app-key")
-        }
+        req.setValue("Bearer \(Config.dashScopeAPIKey)", forHTTPHeaderField: "Authorization")
 
         let prompt = buildPrompt(word: word, context: context, language: language,
                                  isPhrase: isPhrase, phoneticWord: phoneticWord)
         let body: [String: Any] = [
+            "model": Config.model,
+            "stream": true,
+            // Cap output at 800 tokens (~400–530 Chinese chars). The old proxy
+            // locked a limit server-side; without it the model ran long, doubling
+            // latency and output cost. 800 comfortably fits a full word card
+            // (meaning + POS + examples + phonetics) and only trims pathological
+            // over-long generations.
+            "max_tokens": 800,
             "messages": [["role": "user", "content": prompt]]
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -130,7 +137,7 @@ class AIService: ObservableObject {
         // A non-200 yields no SSE deltas, so it would otherwise surface as an
         // empty card. Throw so the retry / failed-state path can handle it.
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            print("🔴 代理流式状态码：\(http.statusCode)")
+            print("🔴 DashScope 流式状态码：\(http.statusCode)")
             throw URLError(.badServerResponse)
         }
 
@@ -199,7 +206,7 @@ class AIService: ObservableObject {
         Respond in EXACTLY this line format, nothing else, no extra text:
         PHON: <IPA pronunciation>
         POS: <part of speech in \(lang)>
-        DEF: <up to 3 short senses in \(lang), separated by ；>
+        DEF: <up to 3 short DICTIONARY senses in \(lang), separated by ；. Each sense is 1-4 words. Do NOT translate the sentence, do NOT add examples, do NOT use commas to list — only the bare senses.>
         """
 
         if hasContext {
@@ -232,8 +239,13 @@ class AIService: ObservableObject {
             else if let v = value(of: "CTX:", in: line) { ctx = v }
         }
 
+        // Split senses on SEMICOLONS ONLY. Commas (Chinese ，or ASCII ,) are
+        // punctuation *inside* a sense ("不断地把某物灌下去，使其保持") — splitting
+        // on them shredded a single explanatory clause into several bogus
+        // "meanings", which is how a card ended up reading like half a sentence
+        // ("…他们不断把它灌下去。我投资了"). Dictionary senses are delimited by ；.
         let meanings = def
-            .split(whereSeparator: { "；;，,".contains($0) })
+            .split(whereSeparator: { "；;".contains($0) })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
 

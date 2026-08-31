@@ -84,6 +84,10 @@ struct WordCardView: View {
             content
 
             // Action row — 🔊 pronounce + ♥ save, evenly spaced. Appears once streaming settles.
+            // These are the card's PRIMARY, high-frequency actions, so they're
+            // deliberately kept LARGE (36pt) — bigger than the 20pt chrome icons
+            // (back / globe / close). Consistency there is about header chrome; here
+            // the priority is an easy, obvious tap target.
             if case .loaded(let exp) = state, !isStreaming {
                 HStack {
                     Spacer()
@@ -217,6 +221,12 @@ struct WordCardView: View {
             context.insert(SavedWord(from: exp, snapshot: snapshot))
             onSaved?()   // trigger the top heart-flash
         }
+        // Persist immediately. Without this, autosave defers the write (often
+        // until backgrounding), so OTHER views observing the same store via
+        // @Query — e.g. the camera screen's top-right saved-count badge — don't
+        // refresh until the app is relaunched. An explicit save fires the store
+        // change notification now, so every @Query updates live.
+        try? context.save()
     }
 }
 
