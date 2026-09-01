@@ -15,13 +15,6 @@ struct LibraryView: View {
     // item (not a Bool) means the sheet always renders the tapped word.
     @State private var detailItem: SavedWord? = nil
 
-    #if DEBUG
-    // DEBUG-only: opens the reunion design gallery as a real in-app sheet, and a
-    // button to seed fake saved words so the collection/足迹 pages render populated
-    // on a real device. Stripped entirely from release builds.
-    @State private var showReunionGallery = false
-    #endif
-
     // Which view of the collection is showing: the flat photo album (default) or
     // the 足迹 timeline that groups saves by place + month.
     private enum Mode: Hashable { case album, footprint }
@@ -80,17 +73,6 @@ struct LibraryView: View {
                             .frame(width: 28, height: 28)
                     }
                 }
-                #if DEBUG
-                ToolbarItem(placement: .topBarTrailing) {
-                    // DEBUG hammer: opens the reunion design gallery on-device.
-                    Button {
-                        showReunionGallery = true
-                    } label: {
-                        Image(systemName: "hammer.fill")
-                            .font(.system(size: 18, weight: .semibold))
-                    }
-                }
-                #endif
             }
             // Album / 足迹 switch moved OUT of the nav bar to a floating tab bar
             // pinned at the BOTTOM — modeled on the Photos app 图库/精选集 bar
@@ -106,14 +88,6 @@ struct LibraryView: View {
             .sheet(isPresented: $showLanguagePicker) {
                 languagePicker
             }
-            #if DEBUG
-            .sheet(isPresented: $showReunionGallery) {
-                ReunionDebugSheet(onSeed: {
-                    ReunionSampleData.seed(into: context)
-                    showReunionGallery = false
-                })
-            }
-            #endif
             // Detail slides up from the bottom instead of pushing in. Full-height
             // so the letterboxed page + floating card have the same room they had
             // as a pushed screen. The visible drag indicator is the native cue that
