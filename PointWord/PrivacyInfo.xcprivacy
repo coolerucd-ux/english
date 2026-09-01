@@ -6,16 +6,61 @@
 	<key>NSPrivacyTracking</key>
 	<false/>
 
-	<!-- No tracking domains: the app talks only to its own word-lookup backend. -->
+	<!-- No tracking domains: the app talks only to its own word-lookup backend
+	     (DashScope). Nothing here feeds cross-app/site tracking. -->
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
 
-	<!-- No data is linked to the user's identity or used for tracking.
-	     Word text + surrounding context are sent to the lookup backend to
-	     produce a definition; they are not tied to an identity, not used for
-	     tracking, and no images ever leave the device. -->
+	<!-- Data the app SENDS to its lookup backend (Aliyun DashScope) to produce a
+	     definition / scene caption. None of it is tied to an identity and none is
+	     used for tracking — but it DOES leave the device, so it must be declared:
+	       • Photos or Videos — the frame captured when a word is saved is sent to
+	         the vision model to caption the scene (AIService.describeSnapshot).
+	       • Other User Content — the pointed word + surrounding sentence are sent
+	         to the text model for the definition (AIService.streamLookup).
+	       • Precise Location — CoreLocation reverse-geocodes to a city name that is
+	         stored WITH the saved word; used only for the app's footprints feature.
+	     All: linked=false (not tied to identity), tracking=false, purpose = app
+	     functionality. -->
 	<key>NSPrivacyCollectedDataTypes</key>
-	<array/>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePhotosorVideos</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherUserContent</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypePreciseLocation</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
 
 	<!-- Required Reason APIs actually used by the app. -->
 	<key>NSPrivacyAccessedAPITypes</key>
