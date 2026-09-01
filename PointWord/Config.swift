@@ -46,4 +46,10 @@ enum Config {
     // The model the proxy used to lock server-side. qwen-plus balances quality and
     // cost; switch to qwen-turbo for cheaper/faster or qwen-max for best quality.
     static let model = "qwen-plus"
+
+    // Vision model for the one-line "scene" description of the save photo (feeds
+    // the word-reunion banner's 地点/主题). qwen-vl-plus is the cheap multimodal
+    // tier and is plenty for a short "where/what" caption. Runs once per SAVE
+    // (not per frame), so its cost/latency never touches the live recognition path.
+    static let visionModel = "qwen-vl-plus"
 }

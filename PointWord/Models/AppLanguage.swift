@@ -75,14 +75,28 @@ enum AppLanguage: String, CaseIterable, Identifiable {
 
     var myWordsTitle: String {
         switch self {
-        case .zhHant: return "我收藏的"
-        case .zhHans: return "我收藏的"
+        case .zhHant: return "收藏"
+        case .zhHans: return "收藏"
         case .ko:     return "내 즐겨찾기"
         case .ja:     return "お気に入り"
         case .fr:     return "Mes favoris"
         case .es:     return "Mis favoritos"
         case .pt:     return "Meus favoritos"
         case .it:     return "I miei preferiti"
+        }
+    }
+
+    // Shown as the large title when the 足迹 tab is selected.
+    var footprintTitle: String {
+        switch self {
+        case .zhHant: return "足跡"
+        case .zhHans: return "足迹"
+        case .ko:     return "발자취"
+        case .ja:     return "足あと"
+        case .fr:     return "Parcours"
+        case .es:     return "Recorrido"
+        case .pt:     return "Trajeto"
+        case .it:     return "Percorso"
         }
     }
 
@@ -332,6 +346,222 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .es:     return "Volver a escanear"
         case .pt:     return "Escanear de novo"
         case .it:     return "Scansiona di nuovo"
+        }
+    }
+
+    // MARK: - Word reunion
+
+    // The whole reunion banner as ONE natural sentence, e.g.
+    // "👋 这是你第 4 次见它，最近是今年5月纽约的菜单". Folds the count, a friendly
+    // calendar time (from reunionWhen), and the photo scene into a single line —
+    // the banner is just this string + a chevron. When the scene caption is empty
+    // (offline save / VL failure / old data) we drop it and only say when.
+    func reunionLine(count: Int, when: String, scene: String) -> String {
+        let s = scene.isEmpty
+        switch self {
+        case .zhHans: return s ? "👋 这是你第 \(count) 次见它，最近一次是\(when)"
+                               : "👋 这是你第 \(count) 次见它，最近是\(when)\(scene)"
+        case .zhHant: return s ? "👋 這是你第 \(count) 次見它，最近一次是\(when)"
+                               : "👋 這是你第 \(count) 次見它，最近是\(when)\(scene)"
+        case .ko:     return s ? "👋 \(count)번째 만남이에요 · \(when)"
+                               : "👋 \(count)번째 만남이에요 · \(when) \(scene)"
+        case .ja:     return s ? "👋 \(count) 回目の再会 · 前回は\(when)"
+                               : "👋 \(count) 回目の再会 · 前回は\(when)\(scene)"
+        case .fr:     return s ? "👋 \(count)ᵉ rencontre · vu \(when)"
+                               : "👋 \(count)ᵉ rencontre · vu \(when), \(scene)"
+        case .es:     return s ? "👋 \(count).ª vez · visto \(when)"
+                               : "👋 \(count).ª vez · visto \(when), \(scene)"
+        case .pt:     return s ? "👋 \(count).ª vez · visto \(when)"
+                               : "👋 \(count).ª vez · visto \(when), \(scene)"
+        case .it:     return s ? "👋 \(count)ª volta · visto \(when)"
+                               : "👋 \(count)ª volta · visto \(when), \(scene)"
+        }
+    }
+
+    // "when" piece for the reunion line — a friendly CALENDAR phrase (not "3天前"):
+    // today / yesterday, else the month (this year) or year+month. The word being
+    // saved on an earlier day is the trigger, so this is normally month-level.
+    func reunionWhen(_ date: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(date) {
+            switch self {
+            case .zhHans, .zhHant: return "今天"
+            case .ko: return "오늘"; case .ja: return "今日"
+            case .fr: return "aujourd'hui"; case .es: return "hoy"
+            case .pt: return "hoje"; case .it: return "oggi"
+            }
+        }
+        if cal.isDateInYesterday(date) {
+            switch self {
+            case .zhHans, .zhHant: return "昨天"
+            case .ko: return "어제"; case .ja: return "昨日"
+            case .fr: return "hier"; case .es: return "ayer"
+            case .pt: return "ontem"; case .it: return "ieri"
+            }
+        }
+        let sameYear = cal.isDate(date, equalTo: .now, toGranularity: .year)
+        let df = DateFormatter()
+        df.locale = Locale(identifier: localeIdentifier)
+        df.setLocalizedDateFormatFromTemplate(sameYear ? "MMMM" : "yMMMM")
+        let base = df.string(from: date)
+        // zh reads more naturally with a "今年" lead-in for same-year months.
+        if sameYear, self == .zhHans || self == .zhHant { return "今年" + base }
+        return base
+    }
+
+    // Locale used to format the reunion calendar phrase above, so month/year names
+    // follow the learner's chosen language, not the device locale.
+    var localeIdentifier: String {
+        switch self {
+        case .zhHant: return "zh-Hant"
+        case .zhHans: return "zh-Hans"
+        case .ko:     return "ko"
+        case .ja:     return "ja"
+        case .fr:     return "fr"
+        case .es:     return "es"
+        case .pt:     return "pt"
+        case .it:     return "it"
+        }
+    }
+
+    // Formats the saved-word count for the top badge, localized (Plan A). Small
+    // counts read exactly with a grouping separator (52089 → "52,089" / "52.089");
+    // once they'd grow the always-visible pill, they collapse to the language's own
+    // compact form (中文 "5.2万", en "52K") so the badge width stays stable and never
+    // jitters as the tally climbs. Uses the learner's chosen language, not the
+    // device locale, to match the rest of the UI.
+    func badgeCount(_ n: Int) -> String {
+        let locale = Locale(identifier: localeIdentifier)
+        // Below 10k a plain grouped number is short enough and fully precise.
+        if n < 10_000 {
+            let f = NumberFormatter()
+            f.numberStyle = .decimal
+            f.locale = locale
+            return f.string(from: NSNumber(value: n)) ?? "\(n)"
+        }
+        // At/above 10k, use the OS compact notation ("5.2万", "52K", "52 mila") so a
+        // six-plus-digit tally can't stretch the pill.
+        return n.formatted(.number.notation(.compactName).locale(locale))
+    }
+
+    // MARK: - Footprints
+
+    // Segmented tab labels on the collection screen: photo grid vs. footprint timeline.
+    var albumTab: String {
+        switch self {
+        case .zhHant: return "收藏"
+        case .zhHans: return "收藏"
+        case .ko:     return "즐겨찾기"
+        case .ja:     return "お気に入り"
+        case .fr:     return "Favoris"
+        case .es:     return "Favoritos"
+        case .pt:     return "Favoritos"
+        case .it:     return "Preferiti"
+        }
+    }
+
+    var footprintTab: String {
+        switch self {
+        case .zhHant: return "足跡"
+        case .zhHans: return "足迹"
+        case .ko:     return "발자취"
+        case .ja:     return "足あと"
+        case .fr:     return "Parcours"
+        case .es:     return "Recorrido"
+        case .pt:     return "Trajeto"
+        case .it:     return "Percorso"
+        }
+    }
+
+    // Place label for saves with no city and no venue.
+    var unknownPlace: String {
+        switch self {
+        case .zhHant: return "未知地點"
+        case .zhHans: return "未知地点"
+        case .ko:     return "알 수 없는 장소"
+        case .ja:     return "場所不明"
+        case .fr:     return "Lieu inconnu"
+        case .es:     return "Lugar desconocido"
+        case .pt:     return "Local desconhecido"
+        case .it:     return "Luogo sconosciuto"
+        }
+    }
+
+    // A group's month heading — "2024年6月" / "June 2024", localized.
+    func monthLabel(_ date: Date) -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: localeIdentifier)
+        df.setLocalizedDateFormatFromTemplate("yMMMM")
+        return df.string(from: date)
+    }
+
+    // Warm subtitle under the collection title — "你已亲手遇见 47 个单词".
+    func collectionCount(_ n: Int) -> String {
+        switch self {
+        case .zhHant: return "你已親手遇見 \(n) 個單字"
+        case .zhHans: return "你已亲手遇见 \(n) 个单词"
+        case .ko:     return "지금까지 단어 \(n)개를 만났어요"
+        case .ja:     return "これまでに \(n) 語と出会いました"
+        case .fr:     return n == 1 ? "Vous avez rencontré 1 mot" : "Vous avez rencontré \(n) mots"
+        case .es:     return n == 1 ? "Has encontrado 1 palabra" : "Has encontrado \(n) palabras"
+        case .pt:     return n == 1 ? "Você encontrou 1 palavra" : "Você encontrou \(n) palavras"
+        case .it:     return n == 1 ? "Hai incontrato 1 parola" : "Hai incontrato \(n) parole"
+        }
+    }
+
+    // A group's word-count chip — "6 个词" / "6 words".
+    func footprintGroupCount(_ n: Int) -> String {
+        switch self {
+        case .zhHant: return "\(n) 個詞"
+        case .zhHans: return "\(n) 个词"
+        case .ko:     return "단어 \(n)개"
+        case .ja:     return "\(n) 語"
+        case .fr:     return n == 1 ? "1 mot" : "\(n) mots"
+        case .es:     return n == 1 ? "1 palabra" : "\(n) palabras"
+        case .pt:     return n == 1 ? "1 palavra" : "\(n) palavras"
+        case .it:     return n == 1 ? "1 parola" : "\(n) parole"
+        }
+    }
+
+    // Photo-group header — how many encounter shots of one word: "3 张照片".
+    func photoGroupCount(_ n: Int) -> String {
+        switch self {
+        case .zhHant: return "\(n) 張照片"
+        case .zhHans: return "\(n) 张照片"
+        case .ko:     return "사진 \(n)장"
+        case .ja:     return "写真 \(n) 枚"
+        case .fr:     return n == 1 ? "1 photo" : "\(n) photos"
+        case .es:     return n == 1 ? "1 foto" : "\(n) fotos"
+        case .pt:     return n == 1 ? "1 foto" : "\(n) fotos"
+        case .it:     return n == 1 ? "1 foto" : "\(n) foto"
+        }
+    }
+
+    // Footer summary — "共 47 个词 · 3 个地点".
+    func footprintSummary(words: Int, places: Int) -> String {
+        switch self {
+        case .zhHant: return "共 \(words) 個詞 · \(places) 個地點"
+        case .zhHans: return "共 \(words) 个词 · \(places) 个地点"
+        case .ko:     return "총 단어 \(words)개 · 장소 \(places)곳"
+        case .ja:     return "計 \(words) 語 · \(places) か所"
+        case .fr:     return "\(words) mots · \(places) lieux"
+        case .es:     return "\(words) palabras · \(places) lugares"
+        case .pt:     return "\(words) palavras · \(places) lugares"
+        case .it:     return "\(words) parole · \(places) luoghi"
+        }
+    }
+
+    // Empty-state line for the footprint tab before anything is grouped.
+    var footprintEmpty: String {
+        switch self {
+        case .zhHant: return "開始收藏，走出你的英語足跡"
+        case .zhHans: return "开始收藏，走出你的英语足迹"
+        case .ko:     return "단어를 저장해 나만의 발자취를 남겨보세요"
+        case .ja:     return "単語を保存して、英語の足あとを残そう"
+        case .fr:     return "Enregistrez des mots pour tracer votre parcours"
+        case .es:     return "Guarda palabras para trazar tu recorrido"
+        case .pt:     return "Salve palavras para traçar seu trajeto"
+        case .it:     return "Salva parole per tracciare il tuo percorso"
         }
     }
 

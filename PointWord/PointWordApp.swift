@@ -21,6 +21,6 @@ struct PointWordApp: App {
             // dark charcoal, and the two don't match.
             .preferredColorScheme(.dark)
         }
-        .modelContainer(for: SavedWord.self)
+        .modelContainer(for: [SavedWord.self, WordPhoto.self])
     }
 }

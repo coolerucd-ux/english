@@ -43,12 +43,11 @@ struct WordCardView: View {
     }
 
     // OCR sometimes swallows a logo glyph / bullet into the word (e.g. the cup's
-    // "▢ Grid Coffee"). Strip leading & trailing non-letter noise for display so
-    // the title reads clean; the lookup key itself is untouched.
+    // "▢ Grid Coffee") or glues on sentence punctuation ("domain,"). Show the
+    // cleaned form so the title reads clean; the same normalization is applied at
+    // extraction and save time, so this only ever re-cleans legacy dirty rows.
     private var displayTitle: String {
-        let junk = CharacterSet.alphanumerics.inverted
-        return state.word
-            .trimmingCharacters(in: junk.subtracting(CharacterSet(charactersIn: "-'’")))
+        state.word.cleanedWord
     }
 
     var body: some View {
@@ -218,8 +217,50 @@ struct WordCardView: View {
             context.delete(existing)
             onRemoved?()   // let the detail view pop back to the library
         } else {
-            context.insert(SavedWord(from: exp, snapshot: snapshot))
+            let newWord = SavedWord(from: exp, snapshot: snapshot)
+            context.insert(newWord)
+
+            // The first encounter photo of this word's group. Every later-day
+            // reunion appends another, building the "where/when I met this word"
+            // set. The legacy `snapshot` above still stands in for old rows.
+            let firstPhoto = WordPhoto(image: snapshot, createdAt: newWord.createdAt)
+            firstPhoto.word = newWord
+            context.insert(firstPhoto)
+
             onSaved?()   // trigger the top heart-flash
+
+            // Enrich the fresh save for the reunion banner + footprints. The insert
+            // + save below already made the word real, so this only ADDS metadata
+            // later — a slow/failed vision or location lookup never blocks or delays
+            // the save, and the empty defaults just mean the group falls back to a
+            // venue name / "未知地点". Runs on the MAIN actor: the awaits merely
+            // suspend (no UI stall) and both `context` and the model stay main-actor
+            // bound, so there's no cross-actor SwiftData access.
+            if let data = snapshot {
+                let lang = language
+                Task { @MainActor in
+                    // One VL call (scene + venue + emoji) and the GPS/geocode run
+                    // concurrently — independent, so we don't pay their latencies
+                    // back to back.
+                    async let visionTask = AIService.describeSnapshot(imageData: data, language: lang)
+                    async let placeTask = LocationService.shared.currentPlace()
+                    let (vision, place) = await (visionTask, placeTask)
+
+                    newWord.scene = vision.scene
+                    newWord.venue = vision.venue
+                    newWord.venueEmoji = vision.emoji
+                    newWord.placeCity = place.city
+                    newWord.placeCountry = place.country
+                    // Same metadata onto the first photo so the group grid's caption
+                    // matches the word's.
+                    firstPhoto.scene = vision.scene
+                    firstPhoto.venue = vision.venue
+                    firstPhoto.venueEmoji = vision.emoji
+                    firstPhoto.placeCity = place.city
+                    firstPhoto.placeCountry = place.country
+                    try? context.save()
+                }
+            }
         }
         // Persist immediately. Without this, autosave defers the write (often
         // until backgrounding), so OTHER views observing the same store via

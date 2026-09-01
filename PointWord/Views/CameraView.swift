@@ -13,6 +13,11 @@ struct CameraView: View {
     @State private var camera = CameraManager()
     @StateObject private var aiService = AIService()
     @Environment(\.scenePhase) private var scenePhase
+    // Used at trigger time to look up whether the pointed word was saved on an
+    // earlier day (the reunion check). This is a ONE-OFF fetch inside recompute(),
+    // NOT a @Query — a live @Query on this high-refresh view is what got coalesced
+    // away for the badge count, so we deliberately fetch on demand instead.
+    @Environment(\.modelContext) private var modelContext
 
     // NOTE — the saved-word count is NOT queried here anymore. It lives in the
     // dedicated SavedBadgeLabel leaf view (bottom of this file). A @Query on THIS
@@ -31,6 +36,14 @@ struct CameraView: View {
     // longer any path that yields more than one target at once.
     @State private var displayWord: String? = nil
     @State private var cardStates: [String: WordCardState] = [:]
+
+    // Word reunion. When the locked word was saved on an EARLIER day, we still
+    // show the normal explanation card, capped with a small banner (reunionBanner)
+    // summarizing count / last-seen time / scene. Tapping it opens that word in the
+    // collection pager (recallItem). reunionWord = the matched save; nil = normal.
+    @State private var reunionWord: SavedWord? = nil
+    @State private var reunionBanner: ReunionBanner? = nil
+    @State private var recallItem: SavedWord? = nil
     // Words whose answer is still streaming in — drives the typing cursor.
     @State private var streamingWords: Set<String> = []
     // Last query issued per display key — lets a failed card retry with the same params.
@@ -49,6 +62,13 @@ struct CameraView: View {
 
     // Library sheet, opened from the top-right badge.
     @State private var showLibrary = false
+
+    // Location permission is primed the FIRST time a word locks (not at launch and
+    // not deferred to save). CoreLocation's when-in-use prompt is async, so priming
+    // it during recognition means the fix is cached and ready by the time the user
+    // taps 收藏 — the first save then actually gets a city instead of "未知地点".
+    // Once per launch.
+    @State private var didPrimeLocation = false
 
     // Onboarding-hint lifecycle. Shown once on the first cold launch, capped at
     // hintVisibleDuration, and hidden the instant a card appears. Not re-shown on
@@ -147,6 +167,16 @@ struct CameraView: View {
         .animation(.easeInOut(duration: 0.35), value: hintVisible)
         .fullScreenCover(isPresented: $showLibrary) {
             LibraryView()
+        }
+        // "去回忆" from the reunion banner — open THIS word's photo group: a
+        // 3-per-row album of every time it was met (where/when), tappable into a
+        // swipeable full-screen viewer. Presented as a bottom sheet so it feels
+        // like the rest of the collection.
+        .sheet(item: $recallItem) { item in
+            WordPhotoGroupView(word: item, language: language)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationCornerRadius(28)
         }
         .onAppear {
             camera.requestPermissionAndStart()
@@ -346,7 +376,13 @@ struct CameraView: View {
     // the result card in the ZStack.
     @ViewBuilder
     private var scanLineView: some View {
-        if !camera.permissionDenied && !showOverlay {
+        // Gated on isPreviewLive so the sweep only animates over ACTUAL camera
+        // pixels. Before the first frame the screen is black — during the
+        // first-launch camera/network permission prompts there are no pixels yet,
+        // so a scanning animation behind the system dialog reads as a bogus
+        // "loading". No preview → no sweep. (Also kills the cold-start black-gap
+        // flicker.)
+        if camera.isPreviewLive && !camera.permissionDenied && !showOverlay {
             ScanLineView()
         }
     }
@@ -406,12 +442,20 @@ struct CameraView: View {
         .animation(.spring(response: 0.35), value: displayWord)
     }
 
-    // Exactly one word → exactly one card. The old multi-word focus/fold layout
-    // was removed with underline/circle detection.
+    // Exactly one word → exactly one card. When the word is a reunion (saved on an
+    // earlier day), a tappable banner caps the card with the "又见面了" summary;
+    // the card itself is the SAME explanation card as any other result.
     @ViewBuilder
     private var cardBlock: some View {
-        if let word = displayWord {
-            card(for: word)
+        VStack(spacing: 10) {
+            if let banner = reunionBanner {
+                ReunionBannerView(banner: banner, language: language) {
+                    recallItem = reunionWord      // "去回忆" → open the collection pager
+                }
+            }
+            if let word = displayWord {
+                card(for: word)
+            }
         }
     }
 
@@ -451,6 +495,9 @@ struct CameraView: View {
     private func dismiss() {
         displayWord = nil
         isLocked = false
+        reunionWord = nil       // clear any reunion so the next hold starts clean
+        reunionBanner = nil
+        recallItem = nil
         camera.unfreeze()       // drop the still, resume live preview
         camera.resetDetection() // clear stale pointed word so the next card comes
                                 // from a FRESH finger hold, not the leftover result
@@ -526,11 +573,92 @@ struct CameraView: View {
         hintVisible = false                         // a result is up → drop the onboarding hint
         camera.freeze()                             // freeze the live preview into a still
         lockedSnapshot = camera.currentSnapshot()   // freeze the page for the library card
+
+        // Prime location permission during the FIRST recognition. This is where the
+        // when-in-use prompt appears — while the user is looking up their first word,
+        // not at launch. Fire-and-forget: the async prompt returns immediately, the
+        // resolved fix is cached for the save that follows. We don't use the result.
+        if !didPrimeLocation {
+            didPrimeLocation = true
+            Task { _ = await LocationService.shared.currentPlace() }
+        }
+
+        // Reunion check: was this exact word saved on an EARLIER day? If so, cap the
+        // card with the "又见面了" banner and show the SAVED explanation (word /
+        // phonetic / meaning) straight away — no network needed, it's all on record.
+        if let past = reunionCandidate(for: target.term) {
+            // Snapshot the banner BEFORE bumping counters, so "上次见到" reads as the
+            // previous encounter and the count shows THIS visit's ordinal.
+            reunionBanner = ReunionBanner(
+                count: past.seenCount + 1,
+                lastSeen: past.effectiveLastSeen,
+                scene: past.scene
+            )
+            reunionWord = past
+            past.markSeenAgain()                    // record this encounter (count +1, time = now)
+
+            // Grow the word's photo group: this reunion is a fresh sighting, so
+            // append the frame we just froze as another WordPhoto (the "每次重逢
+            // 自动收一张" behaviour). Enrich its place/scene in the background — a
+            // slow/failed vision or GPS lookup never blocks the card.
+            if let shot = lockedSnapshot {
+                let photo = WordPhoto(image: shot)
+                photo.word = past
+                modelContext.insert(photo)
+                let lang = language
+                Task { @MainActor in
+                    async let visionTask = AIService.describeSnapshot(imageData: shot, language: lang)
+                    async let placeTask = LocationService.shared.currentPlace()
+                    let (vision, place) = await (visionTask, placeTask)
+                    photo.scene = vision.scene
+                    photo.venue = vision.venue
+                    photo.venueEmoji = vision.emoji
+                    photo.placeCity = place.city
+                    photo.placeCountry = place.country
+                    try? modelContext.save()
+                }
+            }
+            try? modelContext.save()
+
+            let key = target.displayKey
+            displayWord = key                        // drives showOverlay / the bottom card slot
+            // Reuse the saved fields as a loaded card — instant, offline, identical
+            // to what they saw when they saved it.
+            cardStates[key] = .loaded(explanation(from: past))
+            return
+        }
+
         displayWord = target.displayKey
 
         if cardStates[target.displayKey] == nil {
             lookup(target)
         }
+    }
+
+    // Rebuild a WordExplanation from a saved word — used to render the reunion card
+    // from stored data (same rebuild the library detail view does).
+    private func explanation(from saved: SavedWord) -> WordExplanation {
+        WordExplanation(
+            word: saved.word,
+            phonetic: saved.phonetic,
+            partOfSpeech: saved.partOfSpeech,
+            meanings: saved.meanings,
+            contextPhrase: saved.contextPhrase,
+            contextMeaning: saved.contextMeaning
+        )
+    }
+
+    // The saved record for `term` IF pointing at it should trigger a reunion:
+    // saved before today, and not a high-frequency function word. One-off fetch at
+    // lock time (not per frame) — see the modelContext note at the top of this view.
+    // Matched case-insensitively because OCR casing ("Submitted") can differ from the
+    // canonical saved form ("submitted"), the same way WordCardView.isSaved matches.
+    private func reunionCandidate(for term: String) -> SavedWord? {
+        let key = term.lowercased()
+        guard let saved = try? modelContext.fetch(FetchDescriptor<SavedWord>()),
+              let match = saved.first(where: { $0.word.lowercased() == key }),
+              Reunion.shouldTrigger(word: match) else { return nil }
+        return match
     }
 
     // One thing to look up: the finger-pointed word.
@@ -542,9 +670,16 @@ struct CameraView: View {
 
     // The finger-pointed word, if any. Underline / circle detection was removed,
     // so pointing is the only path to a result — always at most one word.
+    //
+    // OCR often glues the sentence's punctuation onto the word ("domain,"). We
+    // clean it HERE, once, so the same string is the card title, the AI term, the
+    // reunion-match key, the stored SavedWord, and the pronounced text — detail,
+    // photo, and list thumbnail then all read identically. Guard against a token
+    // that was ALL punctuation (cleaning to empty) by falling back to the raw text.
     private func targetWord() -> QueryUnit? {
         guard let w = camera.pointedWord, !w.text.isEmpty else { return nil }
-        return QueryUnit(displayKey: w.text, term: w.text, context: w.context)
+        let clean = w.text.cleanedWord.isEmpty ? w.text : w.text.cleanedWord
+        return QueryUnit(displayKey: clean, term: clean, context: w.context)
     }
 
     // MARK: - AI Lookup
@@ -554,7 +689,11 @@ struct CameraView: View {
     // so it appears instantly instead of after a spinner.
     private func prefetchHovered() {
         guard !isLocked, let w = camera.hoveringWord, !w.text.isEmpty else { return }
-        lookup(QueryUnit(displayKey: w.text, term: w.text, context: w.context))
+        // Clean identically to targetWord() so the prefetch caches under the SAME
+        // key the locked card will read — otherwise "domain," and "domain" would
+        // miss each other's cache and refetch.
+        let clean = w.text.cleanedWord.isEmpty ? w.text : w.text.cleanedWord
+        lookup(QueryUnit(displayKey: clean, term: clean, context: w.context))
     }
 
     private func lookup(_ unit: QueryUnit) {
@@ -710,10 +849,16 @@ struct CameraDeniedView: View {
 // has nothing to coalesce against, so every insert/delete redraws it at once.
 private struct SavedBadgeLabel: View {
     @Query private var saved: [SavedWord]
+    @AppStorage("appLanguage") private var languageRaw = AppLanguage.deviceDefault.rawValue
+    private var language: AppLanguage { AppLanguage(rawValue: languageRaw) ?? .zhHans }
 
     var body: some View {
-        Text("\(saved.count)")
+        // Localized, width-stable count (Plan A): grouped below 10k ("52,089"),
+        // compact above ("5.2万" / "52K"). Never truncates, never jitters the pill.
+        Text(language.badgeCount(saved.count))
             .font(.system(size: 17, weight: .semibold))
+            .lineLimit(1)
+            .contentTransition(.numericText())
     }
 }
 

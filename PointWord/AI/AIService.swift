@@ -72,6 +72,101 @@ class AIService: ObservableObject {
         }
     }
 
+    // MARK: - Snapshot vision (word reunion + footprints)
+    //
+    // ONE vision call per save that describes the photo three ways, so both the
+    // reunion banner and the footprint grouping are fed without a second request
+    // (cost-conscious — see the user's cost preference):
+    //
+    //   • scene — a natural phrase for the reunion line ("咖啡馆的菜单")
+    //   • venue — a SHORT venue category for footprint grouping ("图书馆", "地铁",
+    //             "飞机上", "广告牌", "书本"); the group's fallback place name when
+    //             there's no GPS city
+    //   • emoji — one emoji standing for that venue (📖 🚇 ✈️ 🪧 …), the group icon
+    //
+    // Runs off the hot path (once, at save) and returns empty fields on any failure
+    // so a missing caption never blocks a save. Non-streaming: short JSON reply.
+    struct SnapshotVision { let scene: String; let venue: String; let emoji: String }
+
+    static func describeSnapshot(imageData: Data, language: AppLanguage) async -> SnapshotVision {
+        let empty = SnapshotVision(scene: "", venue: "", emoji: "")
+        guard let url = URL(string: Config.apiURL) else { return empty }
+
+        let b64 = imageData.base64EncodedString()
+        let prompt = """
+        This photo was taken when a language learner was reading English text in the \
+        real world. Reply with ONLY a compact JSON object, no markdown, no prose:
+        {"scene":"…","venue":"…","emoji":"…"}
+        - scene: a short noun phrase in \(language.promptName) for what/where this is, \
+        fit to drop into "last seen at the ___" — e.g. "咖啡馆的菜单", "街头的广告牌", \
+        "一本英文书". Max 10 characters / 4 words.
+        - venue: 2–4 characters in \(language.promptName) naming the KIND of place, \
+        chosen from common categories like 图书馆/地铁/公交/飞机上/咖啡馆/餐厅/书本/\
+        杂志/广告牌/超市/街道/办公室/学校/博物馆; pick the closest.
+        - emoji: exactly one emoji representing that venue (📖🚇🚌✈️☕🍽️📰🪧🛒🏙️🏢🏫🏛️).
+        """
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(Config.dashScopeAPIKey)", forHTTPHeaderField: "Authorization")
+
+        // Qwen-VL takes OpenAI-style multimodal content: text + an image_url whose
+        // URL is a data: URI carrying the base64 JPEG.
+        let body: [String: Any] = [
+            "model": Config.visionModel,
+            "messages": [[
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": prompt],
+                    ["type": "image_url",
+                     "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
+                ]
+            ]],
+            "max_tokens": 96
+        ]
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return empty }
+        req.httpBody = httpBody
+
+        do {
+            let (data, response) = try await Self.session.data(for: req)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 { return empty }
+            let content = Self.extractMessageContent(data)
+            return parseSnapshotVision(content) ?? empty
+        } catch {
+            return empty
+        }
+    }
+
+    // Pull {scene, venue, emoji} out of the model's reply. Tolerates ```json fences
+    // and stray text around the object by slicing to the outermost braces.
+    private static func parseSnapshotVision(_ raw: String) -> SnapshotVision? {
+        guard let start = raw.firstIndex(of: "{"),
+              let end = raw.lastIndex(of: "}") else { return nil }
+        let json = String(raw[start...end])
+        struct V: Decodable { let scene: String?; let venue: String?; let emoji: String? }
+        guard let data = json.data(using: .utf8),
+              let v = try? JSONDecoder().decode(V.self, from: data) else { return nil }
+        let clean: (String?) -> String = { ($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+        return SnapshotVision(scene: clean(v.scene), venue: clean(v.venue), emoji: clean(v.emoji))
+    }
+
+    // Pulls choices[0].message.content out of a NON-streaming chat completion,
+    // trimmed of stray quotes/whitespace/list glyphs so the phrase reads clean.
+    private static func extractMessageContent(_ data: Data) -> String {
+        struct Reply: Decodable {
+            struct Choice: Decodable {
+                struct Message: Decodable { let content: String? }
+                let message: Message
+            }
+            let choices: [Choice]
+        }
+        guard let reply = try? JSONDecoder().decode(Reply.self, from: data),
+              let raw = reply.choices.first?.message.content else { return "" }
+        return stripListMarkers(raw)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”。.，,、 \n"))
+    }
+
     private func streamTongyi(
         word: String,
         context: String,
