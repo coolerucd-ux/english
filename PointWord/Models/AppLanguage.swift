@@ -632,5 +632,28 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .it:     return "Apri Impostazioni"
         }
     }
+
+    // Label for the in-app privacy-policy link. Apple 5.1.1(i) requires the policy
+    // to be reachable INSIDE the app (not only in App Store metadata) for any app
+    // that collects data — PointWord uses camera + location, so we surface it in
+    // the language sheet's footer.
+    var privacyPolicy: String {
+        switch self {
+        case .zhHant: return "隱私政策"
+        case .zhHans: return "隐私政策"
+        case .ko:     return "개인정보 처리방침"
+        case .ja:     return "プライバシーポリシー"
+        case .fr:     return "Politique de confidentialité"
+        case .es:     return "Política de privacidad"
+        case .pt:     return "Política de Privacidade"
+        case .it:     return "Informativa sulla privacy"
+        }
+    }
+
+    // The hosted policy (GitHub Pages). Region-agnostic — the same page serves both
+    // the English and Chinese sections, matching what's filed in App Store Connect.
+    var privacyPolicyURL: URL {
+        URL(string: "https://coolerucd-ux.github.io/english/privacy.html")!
+    }
 }
 

@@ -173,7 +173,17 @@ struct CameraView: View {
         // swipeable full-screen viewer. Presented as a bottom sheet so it feels
         // like the rest of the collection.
         .sheet(item: $recallItem) { item in
-            WordPhotoGroupView(word: item, language: language)
+            WordPhotoGroupView(word: item, language: language) {
+                // The word was un-saved from INSIDE the viewer. Tear the whole
+                // reunion stack down from the top in one go — dismissing only the
+                // inner pager would leave this group sheet holding a now-deleted
+                // SavedWord and it would trap on the next read. Also drop the stale
+                // reunion banner so tapping "去回忆" again can't reopen the deleted
+                // word (that read would crash too).
+                recallItem = nil
+                reunionWord = nil
+                reunionBanner = nil
+            }
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
                 .presentationCornerRadius(28)

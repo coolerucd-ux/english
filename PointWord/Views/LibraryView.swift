@@ -204,19 +204,37 @@ struct LibraryView: View {
     private var languagePicker: some View {
         NavigationStack {
             List {
-                ForEach(AppLanguage.allCases) { lang in
-                    Button {
-                        languageRaw = lang.rawValue
-                        showLanguagePicker = false
-                    } label: {
+                Section {
+                    ForEach(AppLanguage.allCases) { lang in
+                        Button {
+                            languageRaw = lang.rawValue
+                            showLanguagePicker = false
+                        } label: {
+                            HStack {
+                                Text(lang.displayName)
+                                    .foregroundColor(.primary)
+                                Spacer()
+                                if lang == language {
+                                    Image(systemName: "checkmark")
+                                        .foregroundColor(.yellow)
+                                }
+                            }
+                        }
+                    }
+                }
+                // In-app privacy-policy link. Apple 5.1.1(i) requires the policy to be
+                // reachable INSIDE the app (camera + location = data collection), not
+                // only in App Store metadata. Tucked in the sheet footer so it meets
+                // the rule without intruding on the main flow.
+                Section {
+                    Link(destination: language.privacyPolicyURL) {
                         HStack {
-                            Text(lang.displayName)
+                            Text(language.privacyPolicy)
                                 .foregroundColor(.primary)
                             Spacer()
-                            if lang == language {
-                                Image(systemName: "checkmark")
-                                    .foregroundColor(.yellow)
-                            }
+                            Image(systemName: "arrow.up.right")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
                         }
                     }
                 }
@@ -631,6 +649,10 @@ private struct FootprintGroupView: View {
 struct WordPhotoGroupView: View {
     let word: SavedWord
     let language: AppLanguage
+    // Fired when the word is un-saved (deleted) from inside the full-screen pager.
+    // The presenter uses it to tear down the WHOLE reunion stack at once — see the
+    // camera's .sheet(item: $recallItem). Optional so other callers can omit it.
+    var onWordRemoved: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
     @State private var openedPhoto: WordPhotoItem? = nil
@@ -700,7 +722,13 @@ struct WordPhotoGroupView: View {
         }
         // Full-screen swipeable per-photo detail, opening on the tapped shot.
         .fullScreenCover(item: $openedPhoto) { photo in
-            WordPhotoPager(items: items, current: photo, word: word, language: language)
+            WordPhotoPager(items: items, current: photo, word: word, language: language) {
+                // Word un-saved from inside the pager. Close the pager first, then
+                // bubble up so the presenter can dismiss this group sheet too — both
+                // hold the now-deleted SavedWord and must go together.
+                openedPhoto = nil
+                onWordRemoved?()
+            }
         }
     }
 }
@@ -745,14 +773,19 @@ private struct WordPhotoPager: View {
     let current: WordPhotoItem
     let word: SavedWord
     let language: AppLanguage
+    // Fired when the word is un-saved from a page's card. Lets the group sheet (and
+    // the whole reunion stack above it) tear down together — dismissing only this
+    // pager would leave outer views holding the deleted SavedWord.
+    var onWordRemoved: (() -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var selection: String
 
-    init(items: [WordPhotoItem], current: WordPhotoItem, word: SavedWord, language: AppLanguage) {
+    init(items: [WordPhotoItem], current: WordPhotoItem, word: SavedWord, language: AppLanguage, onWordRemoved: (() -> Void)? = nil) {
         self.items = items
         self.current = current
         self.word = word
         self.language = language
+        self.onWordRemoved = onWordRemoved
         _selection = State(initialValue: current.id)
     }
 
@@ -811,12 +844,13 @@ private struct WordPhotoPager: View {
 
             VStack(spacing: 10) {
                 // Full word card — word / phonetic / meanings / 语境解释 — the same
-                // one the collection detail floats. Removing the word from here
-                // dismisses the whole viewer, matching WordDetailView's onRemoved.
+                // one the collection detail floats. Un-saving from here can't just
+                // dismiss this pager: outer reunion views still hold the deleted word
+                // and would trap. Bubble up so the whole stack tears down together.
                 WordCardView(
                     state: .loaded(explanation),
                     language: language,
-                    onRemoved: { dismiss() }
+                    onRemoved: { onWordRemoved?() }
                 )
 
                 // Caption chip for THIS sighting: place + time — identical in shape

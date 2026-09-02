@@ -11,8 +11,8 @@ import UIKit
 // inside the collection list, reusing the library's swipe-through detail.
 //
 // Trigger (unchanged, deliberately minimal — per spec "全砍"):
-//   • Trigger  = saved ✓  AND  last-saved date ≠ today ✓
-//   • Skips    = saved TODAY (anti-spam), or a high-frequency word (whitelist)
+//   • Trigger  = saved ✓  AND  last seen ≥ 24h ago ✓
+//   • Skips    = seen within the last 24h (anti-spam), or a high-frequency word
 //   • NO word-form normalization, NO scheduling.
 // Everything the banner and card show already lives on the SavedWord, so the
 // reunion needs no network and appears instantly.
@@ -33,9 +33,12 @@ enum Reunion {
     // Is this reappearing word a reunion candidate? Pure decision, no side effects.
     static func shouldTrigger(word: SavedWord) -> Bool {
         if highFrequency.contains(word.word.lowercased()) { return false }
-        // Saved today → skip, so a word just added doesn't immediately "reunite".
-        if Calendar.current.isDateInToday(word.createdAt) { return false }
-        return true
+        // Fire only once at least 24h have passed since the word was LAST seen — a
+        // rolling window off effectiveLastSeen (seeds from createdAt for old rows).
+        // Each reunion calls markSeenAgain(), which stamps lastSeenAt = now, so the
+        // next one can't fire until another 24h elapse — no repeat banners the same
+        // day. (Basing this on createdAt would re-fire on every point once a day old.)
+        return Date().timeIntervalSince(word.effectiveLastSeen) >= 24 * 60 * 60
     }
 }
 

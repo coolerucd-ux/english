@@ -68,6 +68,18 @@ struct OnboardingView: View {
                     .glassProminentCapsule(tint: .white)
             }
             .padding(.horizontal, 40)
+
+            // Privacy policy, right under the entry button. The next taps prime the
+            // camera + location prompts, so surfacing the policy at the very first
+            // screen is the clearest place for it (Apple 5.1.1(i) — the policy must be
+            // reachable IN-app, not only in App Store metadata). Opens in the browser.
+            Link(destination: language.privacyPolicyURL) {
+                Text(language.privacyPolicy)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .underline()
+            }
+            .padding(.top, 16)
             .padding(.bottom, 40)
         }
     }
