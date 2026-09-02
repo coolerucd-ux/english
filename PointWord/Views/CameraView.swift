@@ -580,7 +580,7 @@ struct CameraView: View {
         // resolved fix is cached for the save that follows. We don't use the result.
         if !didPrimeLocation {
             didPrimeLocation = true
-            Task { _ = await LocationService.shared.currentPlace() }
+            Task { _ = await LocationService.shared.currentPlace(language: language) }
         }
 
         // Reunion check: was this exact word saved on an EARLIER day? If so, cap the
@@ -608,7 +608,7 @@ struct CameraView: View {
                 let lang = language
                 Task { @MainActor in
                     async let visionTask = AIService.describeSnapshot(imageData: shot, language: lang)
-                    async let placeTask = LocationService.shared.currentPlace()
+                    async let placeTask = LocationService.shared.currentPlace(language: lang)
                     let (vision, place) = await (visionTask, placeTask)
                     photo.scene = vision.scene
                     photo.venue = vision.venue

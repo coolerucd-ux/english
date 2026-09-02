@@ -1,6 +1,6 @@
 import Foundation
 
-struct WordExplanation {
+struct WordExplanation: Codable {
     let word: String
     let phonetic: String            // /ˌiːvəˈluːʃən/
     let partOfSpeech: String        // 名词

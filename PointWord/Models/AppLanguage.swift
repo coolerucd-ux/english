@@ -487,6 +487,33 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         }
     }
 
+    // Localized venue name from a STORED venue value. The stored value is a
+    // language-neutral code ("book") for new saves, or a legacy localized string
+    // ("书本") for old ones — VenueCatalog folds both to the current language. Falls
+    // back to the raw string for anything it can't map, and nil when empty. This is
+    // what makes the footprint / detail place labels re-adapt on a language switch
+    // instead of staying frozen in the capture-time language.
+    func venueName(_ venue: String) -> String? {
+        if let localized = VenueCatalog.name(venue, in: self) { return localized }
+        let raw = venue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : raw
+    }
+
+    // The "城市 · 场所" caption from stored fields, with the venue localized on the
+    // fly. The city is shown in whatever language it was reverse-geocoded in at save
+    // time (we don't keep coordinates to re-geocode). Returns nil when neither the
+    // city nor a venue is known, so the caller shows a time-only chip.
+    func placeLabel(city: String, venue: String) -> String? {
+        let cityTrimmed = city.trimmingCharacters(in: .whitespacesAndNewlines)
+        let venueName = self.venueName(venue) ?? ""
+        switch (cityTrimmed.isEmpty, venueName.isEmpty) {
+        case (false, false): return "\(cityTrimmed) · \(venueName)"
+        case (false, true):  return cityTrimmed
+        case (true, false):  return venueName
+        case (true, true):   return nil
+        }
+    }
+
     // A group's month heading — "2024年6月" / "June 2024", localized.
     func monthLabel(_ date: Date) -> String {
         let df = DateFormatter()

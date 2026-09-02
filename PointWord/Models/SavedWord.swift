@@ -99,16 +99,21 @@ final class SavedWord {
     // ── Footprint grouping ────────────────────────────────────────────────────
 
     // The place label for the footprint group: the GPS city if we have one, else
-    // the AI venue category ("图书馆"), else "" so the caller shows "未知地点".
+    // the AI venue category, else "" so the caller shows "未知地点". This returns the
+    // RAW venue (a language-neutral code for new saves); callers that show it to the
+    // user localize via AppLanguage.venueName(_:). Kept for the footprintKey and
+    // non-localized needs.
     var placeName: String {
         if !placeCity.isEmpty { return placeCity }
         if !venue.isEmpty { return venue }
         return ""
     }
 
-    // The leading icon for the group — the AI venue emoji, or a neutral pin.
+    // The leading icon for the group — the stored venue emoji, else one derived
+    // from the venue code (covers rows saved without an emoji), else a neutral pin.
     var placeEmoji: String {
-        venueEmoji.isEmpty ? "📍" : venueEmoji
+        if !venueEmoji.isEmpty { return venueEmoji }
+        return VenueCatalog.emoji(for: venue)
     }
 
     // Stable identity for a "place + month" bucket. Independent of display language

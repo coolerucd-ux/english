@@ -29,9 +29,11 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
     private var timeoutTask: Task<Void, Never>?
 
     // Cache the last resolved place so repeated saves in one sitting don't re-hit
-    // GPS/geocoder. Reverse geocoding especially is rate-limited by iOS.
+    // GPS/geocoder. Reverse geocoding especially is rate-limited by iOS. Keyed by
+    // the display locale too, so switching the app language re-geocodes in the new
+    // language instead of serving a stale city name from the old one.
     private var cachedPlace: ResolvedPlace?
-    private struct ResolvedPlace { let city: String; let country: String; let at: Date }
+    private struct ResolvedPlace { let city: String; let country: String; let locale: String; let at: Date }
     private let cacheTTL: TimeInterval = 5 * 60
 
     private override init() {
@@ -44,9 +46,15 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
     // get one for any reason. Never throws, never blocks the caller meaningfully.
     struct Place { let city: String; let country: String }
 
-    func currentPlace() async -> Place {
-        // Serve from cache when it's fresh — avoids waking GPS on every save.
-        if let c = cachedPlace, Date().timeIntervalSince(c.at) < cacheTTL {
+    // `language`, when given, phrases the city/country in the learner's chosen UI
+    // language (not the device locale) so the footprint labels match the rest of
+    // the app. nil keeps the system locale (used by callers that only PRIME the
+    // permission and discard the result).
+    func currentPlace(language: AppLanguage? = nil) async -> Place {
+        let localeID = language?.localeIdentifier ?? ""
+        // Serve from cache when it's fresh AND geocoded in the SAME language.
+        if let c = cachedPlace, c.locale == localeID,
+           Date().timeIntervalSince(c.at) < cacheTTL {
             return Place(city: c.city, country: c.country)
         }
 
@@ -69,9 +77,9 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
             return Place(city: "", country: "")
         }
 
-        let place = await reverseGeocode(location)
+        let place = await reverseGeocode(location, language: language)
         if !place.city.isEmpty || !place.country.isEmpty {
-            cachedPlace = ResolvedPlace(city: place.city, country: place.country, at: Date())
+            cachedPlace = ResolvedPlace(city: place.city, country: place.country, locale: localeID, at: Date())
         }
         return place
     }
@@ -105,11 +113,13 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
 
     // MARK: - Reverse geocode
 
-    private func reverseGeocode(_ location: CLLocation) async -> Place {
+    private func reverseGeocode(_ location: CLLocation, language: AppLanguage?) async -> Place {
         let geocoder = CLGeocoder()
-        // Ask iOS to phrase place names in the app's own display language later;
-        // CLGeocoder localizes using the device/app locale automatically.
-        guard let marks = try? await geocoder.reverseGeocodeLocation(location),
+        // Phrase place names in the app's chosen language when we have one, so the
+        // footprint city matches the rest of the UI (e.g. "杭州市" vs "Hangzhou").
+        // Falling back to nil lets CLGeocoder use the device locale.
+        let locale = language.map { Locale(identifier: $0.localeIdentifier) }
+        guard let marks = try? await geocoder.reverseGeocodeLocation(location, preferredLocale: locale),
               let mark = marks.first else {
             return Place(city: "", country: "")
         }

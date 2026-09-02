@@ -243,7 +243,7 @@ struct WordCardView: View {
                     // concurrently — independent, so we don't pay their latencies
                     // back to back.
                     async let visionTask = AIService.describeSnapshot(imageData: data, language: lang)
-                    async let placeTask = LocationService.shared.currentPlace()
+                    async let placeTask = LocationService.shared.currentPlace(language: lang)
                     let (vision, place) = await (visionTask, placeTask)
 
                     newWord.scene = vision.scene

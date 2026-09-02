@@ -385,14 +385,7 @@ private struct WordDetailView: View {
     // venue joined by "·", or just whichever one exists. nil when the row has
     // neither (old saves) — we then show only the time, no empty chip.
     private var placeLabel: String? {
-        let city = item.placeCity
-        let venue = item.venue
-        switch (city.isEmpty, venue.isEmpty) {
-        case (false, false): return "\(city) · \(venue)"
-        case (false, true):  return city
-        case (true, false):  return venue
-        case (true, true):   return nil
-        }
+        language.placeLabel(city: item.placeCity, venue: item.venue)
     }
 
     var body: some View {
@@ -502,10 +495,18 @@ private struct FootprintList: View {
         return order.map { key in
             let members = buckets[key] ?? []
             let head = members.first
+            // Localize the place: prefer the GPS city (already in some language),
+            // else the venue localized to the CURRENT language from its stored code
+            // — so a group headed by a venue re-labels on a language switch.
+            let place: String = {
+                guard let head else { return "" }
+                if !head.placeCity.isEmpty { return head.placeCity }
+                return language.venueName(head.venue) ?? ""
+            }()
             return FootprintGroup(
                 id: key,
                 emoji: head?.placeEmoji ?? "📍",
-                place: head?.placeName ?? "",
+                place: place,
                 month: head?.createdAt ?? .now,
                 words: members
             )
@@ -818,9 +819,11 @@ private struct WordPhotoPager: View {
                     onRemoved: { dismiss() }
                 )
 
-                // Caption chip for THIS sighting: scene (if any) + place + time. The
-                // scene is what makes it "当前场景" — it belongs to the photo, not the
-                // word, so each page can read differently ("地铁里的读物" vs "咖啡馆").
+                // Caption chip for THIS sighting: place + time — identical in shape
+                // to the ordinary WordDetailView caption, so opening a reunion photo
+                // reads the same as opening the word from the collection. The photo's
+                // `scene` is intentionally NOT shown here (the normal detail has no
+                // scene line either); it still lives on the reunion banner.
                 captionChip(for: photo)
             }
             .padding(.horizontal, 20)
@@ -828,16 +831,12 @@ private struct WordPhotoPager: View {
         }
     }
 
-    // "场景 · Emoji 地点 · 时间" — segments dropped when absent so an old photo with
-    // neither scene nor place still shows a clean time-only chip.
+    // "Emoji 地点 · 时间" — the place segment dropped when absent so an old photo with
+    // no place still shows a clean time-only chip. Matches WordDetailView exactly.
     @ViewBuilder
     private func captionChip(for photo: WordPhotoItem) -> some View {
         HStack(spacing: 8) {
-            if !photo.scene.isEmpty {
-                Text(photo.scene).lineLimit(1)
-                Text("·").foregroundColor(.white.opacity(0.5))
-            }
-            if let place = photo.placeLabel {
+            if let place = language.placeLabel(city: photo.placeCity, venue: photo.venue) {
                 HStack(spacing: 4) {
                     Text(photo.placeEmoji)
                     Text(place).lineLimit(1)

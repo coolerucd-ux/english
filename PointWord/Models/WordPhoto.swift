@@ -54,16 +54,15 @@ struct WordPhotoItem: Identifiable {
     let venueEmoji: String
     let scene: String
 
-    // Leading icon for a caption — the venue emoji, or a neutral pin.
-    var placeEmoji: String { venueEmoji.isEmpty ? "📍" : venueEmoji }
-
-    // "城市 · 场所" caption, or whichever one exists; nil when neither is known.
-    var placeLabel: String? {
-        switch (placeCity.isEmpty, venue.isEmpty) {
-        case (false, false): return "\(placeCity) · \(venue)"
-        case (false, true):  return placeCity
-        case (true, false):  return venue
-        case (true, true):   return nil
-        }
+    // Leading icon for a caption — the stored venue emoji, else one derived from
+    // the venue code (covers rows saved without an emoji), else a neutral pin.
+    var placeEmoji: String {
+        if !venueEmoji.isEmpty { return venueEmoji }
+        return VenueCatalog.emoji(for: venue)
     }
+
+    // NOTE: the display "城市 · 场所" label is built by AppLanguage.placeLabel(city:
+    // venue:) at the call site, NOT here — the venue must be localized to the
+    // CURRENT language (it's stored as a language-neutral code), which needs the
+    // active AppLanguage this model type doesn't carry.
 }

@@ -1,7 +1,11 @@
 import Foundation
 
 class AIService: ObservableObject {
-    private var cache: [String: WordExplanation] = [:]
+    // Word explanations are cached to DISK, not just for this session: every point
+    // costs a model call, so a word already looked up in the same sentence + native
+    // language must never be re-queried — even across app restarts. Bounded LRU,
+    // stored under Caches/ (regenerable, purgeable under storage pressure).
+    private let cache = WordExplanationCache()
 
     // Dedicated session that WAITS for connectivity instead of failing instantly.
     // This matters most on China-region iOS: the very first outbound request pops
@@ -25,7 +29,7 @@ class AIService: ObservableObject {
     }
 
     func cachedResult(for word: String, context: String = "", language: AppLanguage) -> WordExplanation? {
-        cache[key(word: word, context: context, language: language)]
+        cache.value(for: key(word: word, context: context, language: language))
     }
 
     // MARK: - Streaming lookup
@@ -46,8 +50,9 @@ class AIService: ObservableObject {
         AsyncThrowingStream { continuation in
             let k = self.key(word: word, context: context, language: language)
 
-            // Cache hit — emit once, done. Feels instant.
-            if let cached = self.cache[k] {
+            // Cache hit — emit once, done. Feels instant. Survives app restarts:
+            // the same word in the same sentence + language is never re-queried.
+            if let cached = self.cache.value(for: k) {
                 continuation.yield(cached)
                 continuation.finish()
                 return
@@ -61,7 +66,12 @@ class AIService: ObservableObject {
                     ) { partial in
                         continuation.yield(partial)
                     }
-                    self.cache[k] = final
+                    // Only the COMPLETE result is persisted — never a partial, so a
+                    // cache hit always returns the full card. Offline fallbacks are
+                    // handled by the caller and are intentionally NOT cached here.
+                    if !final.isOffline {
+                        self.cache.set(final, for: k)
+                    }
                     continuation.yield(final)
                     continuation.finish()
                 } catch {
@@ -93,17 +103,23 @@ class AIService: ObservableObject {
         guard let url = URL(string: Config.apiURL) else { return empty }
 
         let b64 = imageData.base64EncodedString()
+        // venue is returned as a LANGUAGE-NEUTRAL English CODE (not a display
+        // string): the UI localizes it on the fly via VenueCatalog, so the label
+        // re-adapts whenever the user switches language instead of being frozen in
+        // whatever language was active at capture. scene stays a localized phrase
+        // (it's free prose, only shown on the reunion line). emoji is no longer
+        // asked for — we derive it deterministically from the code.
+        let venueCodes = VenueCatalog.codes.joined(separator: "/")
         let prompt = """
         This photo was taken when a language learner was reading English text in the \
         real world. Reply with ONLY a compact JSON object, no markdown, no prose:
-        {"scene":"…","venue":"…","emoji":"…"}
+        {"scene":"…","venue":"…"}
         - scene: a short noun phrase in \(language.promptName) for what/where this is, \
         fit to drop into "last seen at the ___" — e.g. "咖啡馆的菜单", "街头的广告牌", \
         "一本英文书". Max 10 characters / 4 words.
-        - venue: 2–4 characters in \(language.promptName) naming the KIND of place, \
-        chosen from common categories like 图书馆/地铁/公交/飞机上/咖啡馆/餐厅/书本/\
-        杂志/广告牌/超市/街道/办公室/学校/博物馆; pick the closest.
-        - emoji: exactly one emoji representing that venue (📖🚇🚌✈️☕🍽️📰🪧🛒🏙️🏢🏫🏛️).
+        - venue: ONE lowercase English code naming the KIND of place, chosen strictly \
+        from this list: \(venueCodes); pick the closest. Return the code verbatim, \
+        no translation.
         """
 
         var req = URLRequest(url: url)
@@ -138,17 +154,23 @@ class AIService: ObservableObject {
         }
     }
 
-    // Pull {scene, venue, emoji} out of the model's reply. Tolerates ```json fences
-    // and stray text around the object by slicing to the outermost braces.
+    // Pull {scene, venue} out of the model's reply. Tolerates ```json fences and
+    // stray text around the object by slicing to the outermost braces. The emoji is
+    // NOT parsed — it's derived deterministically from the (normalized) venue code,
+    // so it can't drift from the localized label.
     private static func parseSnapshotVision(_ raw: String) -> SnapshotVision? {
         guard let start = raw.firstIndex(of: "{"),
               let end = raw.lastIndex(of: "}") else { return nil }
         let json = String(raw[start...end])
-        struct V: Decodable { let scene: String?; let venue: String?; let emoji: String? }
+        struct V: Decodable { let scene: String?; let venue: String? }
         guard let data = json.data(using: .utf8),
               let v = try? JSONDecoder().decode(V.self, from: data) else { return nil }
         let clean: (String?) -> String = { ($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
-        return SnapshotVision(scene: clean(v.scene), venue: clean(v.venue), emoji: clean(v.emoji))
+        // Store the canonical code when we recognize it, so display-time localization
+        // and grouping are stable; keep the raw value otherwise (best effort).
+        let rawVenue = clean(v.venue)
+        let venue = VenueCatalog.normalize(rawVenue) ?? rawVenue
+        return SnapshotVision(scene: clean(v.scene), venue: venue, emoji: VenueCatalog.emoji(for: venue))
     }
 
     // Pulls choices[0].message.content out of a NON-streaming chat completion,
