@@ -8,7 +8,7 @@
   :root { color-scheme: light dark; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    line-height: 1.65; max-width: 720px; margin: 0 auto; padding: 40px 20px 80px;
+    line-height: 1.65; max-width: 720px; margin: 0 auto; padding: 0 20px 80px;
     color: #1c1c1e; background: #fff;
   }
   @media (prefers-color-scheme: dark) { body { color: #e5e5e7; background: #000; } a { color: #0a84ff; } }
@@ -17,14 +17,41 @@
   .meta { color: #8e8e93; font-size: .9rem; }
   ul { padding-left: 1.2em; }
   code { background: rgba(128,128,128,.15); padding: 1px 5px; border-radius: 4px; }
-  hr { border: none; border-top: 1px solid rgba(128,128,128,.25); margin: 3em 0; }
-  .lang { color:#8e8e93; font-size:.85rem; letter-spacing:.05em; text-transform:uppercase; margin-top:3em;}
+  hr { border: none; border-top: 1px solid rgba(128,128,128,.25); margin: 3.5em 0; }
+  /* Each language block is a standalone document; the anchor lands right on it,
+     and scroll-margin keeps the heading clear of the sticky language bar. */
+  section { scroll-margin-top: 64px; }
+  /* Sticky language switcher — always reachable, so any reader can jump to theirs. */
+  nav.langnav {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; flex-wrap: wrap; gap: 4px 14px;
+    padding: 12px 0; margin-bottom: 8px;
+    background: rgba(255,255,255,.85); backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid rgba(128,128,128,.2);
+    font-size: .95rem;
+  }
+  @media (prefers-color-scheme: dark) { nav.langnav { background: rgba(0,0,0,.7); } }
+  nav.langnav a { text-decoration: none; color: #0a84ff; }
 </style>
 </head>
 <body>
 
+<nav class="langnav">
+  <a href="#en">EN</a>
+  <a href="#zh-hans">简体</a>
+  <a href="#zh-hant">繁體</a>
+  <a href="#ko">한국어</a>
+  <a href="#ja">日本語</a>
+  <a href="#fr">Français</a>
+  <a href="#es">Español</a>
+  <a href="#pt">Português</a>
+  <a href="#it">Italiano</a>
+</nav>
+
+<!-- ============================ ENGLISH ============================ -->
+<section id="en">
 <h1>PointWord — Privacy Policy</h1>
-<p class="meta">Last updated: September 1, 2026</p>
+<p class="meta">Last updated: September 2, 2026</p>
 
 <p>PointWord ("the app", "we") is a point-to-read English learning app. You point your
 finger at an English word in the real world; the app recognizes it and shows a
@@ -80,12 +107,14 @@ information from children.</p>
 
 <h2>Contact</h2>
 <p>Questions about privacy? Email <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>.</p>
+</section>
 
 <hr>
 
-<p class="lang">中文</p>
+<!-- ======================= 简体中文 ======================= -->
+<section id="zh-hans">
 <h1>PointWord — 隐私政策</h1>
-<p class="meta">最后更新：2026 年 9 月 1 日</p>
+<p class="meta">最后更新：2026 年 9 月 2 日</p>
 
 <p>PointWord（“本应用”）是一款“手指指读”英语学习应用：你用手指指向现实中的英文单词，应用识别后展示释义。本政策说明应用处理哪些数据、数据去向。应用采集的数据极少。</p>
 
@@ -115,8 +144,330 @@ information from children.</p>
 <h2>删除你的数据</h2>
 <p>所有收藏单词与照片都在你的设备上，卸载应用即彻底删除；我们没有服务端副本。</p>
 
+<h2>儿童</h2>
+<p>本应用适合一般大众使用，不会在知情情况下采集儿童的个人信息。</p>
+
+<h2>变更</h2>
+<p>若本政策变更，我们会更新本页顶部的日期。</p>
+
 <h2>联系我们</h2>
 <p>隐私相关问题请联系：<a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>。</p>
+</section>
+
+<hr>
+
+<!-- ======================= 繁體中文 ======================= -->
+<section id="zh-hant">
+<h1>PointWord — 隱私政策</h1>
+<p class="meta">最後更新：2026 年 9 月 2 日</p>
+
+<p>PointWord（「本應用」）是一款「手指指讀」英語學習應用：你用手指指向現實中的英文單字，應用辨識後顯示釋義。本政策說明應用處理哪些資料、資料去向。應用蒐集的資料極少。</p>
+
+<h2>傳送給第三方 AI 服務的資料</h2>
+<p>為產生釋義和一句話場景描述，應用會透過加密（HTTPS）連線，將以下內容傳送給
+<strong>阿里雲 DashScope（百鍊 Model Studio）</strong>這一 AI 服務：</p>
+<ul>
+  <li><strong>單字及其所在句子</strong>——以文字形式傳送，用於取得詞典釋義。</li>
+  <li><strong>收藏單字時拍攝的畫面</strong>——傳送給視覺模型，用於產生一句話場景描述（如「咖啡廳的菜單」），供「重逢橫幅」和「足跡」功能使用。</li>
+</ul>
+<p>這些資料僅用於產生你要求的結果，<strong>不關聯你的身分</strong>、<strong>不用於追蹤</strong>，不附帶任何帳號、裝置識別碼或廣告識別碼。我們不營運自有伺服器，應用直接與 DashScope 通訊；DashScope 對請求資料的處理適用阿里雲自身條款。</p>
+
+<h2>僅儲存在你裝置上的資料</h2>
+<ul>
+  <li><strong>收藏的單字、照片及中繼資料</strong>透過 Apple 的 SwiftData 儲存在本機，不會上傳給我們。</li>
+  <li><strong>位置</strong>：在你授權後，應用僅用位置反查你收藏單字時所在的<em>城市名稱</em>，用於顯示學習「足跡」。城市名與單字一起存在本機；你的精確座標不會傳送給我們或 AI 服務。</li>
+  <li><strong>設定</strong>（所選語言、引導狀態）透過 UserDefaults 儲存在本機。</li>
+</ul>
+
+<h2>我們不蒐集的資料</h2>
+<ul>
+  <li>不需要帳號、註冊，不蒐集姓名、電子郵件或電話號碼。</li>
+  <li>無廣告，無跨應用/網站追蹤。</li>
+  <li>無第三方統計 SDK。</li>
+</ul>
+
+<h2>刪除你的資料</h2>
+<p>所有收藏單字與照片都在你的裝置上，解除安裝應用即徹底刪除；我們沒有伺服器端副本。</p>
+
+<h2>兒童</h2>
+<p>本應用適合一般大眾使用，不會在知情情況下蒐集兒童的個人資訊。</p>
+
+<h2>變更</h2>
+<p>若本政策變更，我們會更新本頁頂部的日期。</p>
+
+<h2>聯絡我們</h2>
+<p>隱私相關問題請聯絡：<a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>。</p>
+</section>
+
+<hr>
+
+<!-- ======================= 한국어 ======================= -->
+<section id="ko">
+<h1>PointWord — 개인정보 처리방침</h1>
+<p class="meta">최종 업데이트: 2026년 9월 2일</p>
+
+<p>PointWord(“본 앱”, “당사”)은 손가락으로 가리켜 읽는 영어 학습 앱입니다. 현실의 영어 단어를 손가락으로 가리키면 앱이 이를 인식해 뜻을 보여줍니다. 본 방침은 앱이 어떤 데이터를 처리하고 어디로 보내는지 설명합니다. 앱이 수집하는 데이터는 매우 적습니다.</p>
+
+<h2>제3자 AI 서비스로 전송하는 데이터</h2>
+<p>뜻과 짧은 장면 설명을 생성하기 위해, 앱은 암호화된(HTTPS) 연결을 통해 다음을 AI 서비스인
+<strong>Alibaba Cloud DashScope(Model Studio)</strong>로 전송합니다:</p>
+<ul>
+  <li><strong>단어와 그 앞뒤 문장</strong> — 사전적 뜻을 얻기 위해 텍스트로 전송됩니다.</li>
+  <li><strong>단어를 저장할 때 촬영한 사진</strong> — 장면을 한 줄로 설명하는 문구(예: “카페 메뉴”)를 생성하기 위해 비전 모델로 전송되며, 재회 배너와 “발자취” 기능에 사용됩니다.</li>
+</ul>
+<p>이 데이터는 오직 요청하신 결과를 생성하기 위해서만 전송됩니다. <strong>신원과 연결되지 않으며</strong>, <strong>추적에 사용되지 않고</strong>, 계정·기기 식별자·광고 식별자가 전혀 부착되지 않습니다. 당사는 자체 서버를 운영하지 않으며 앱은 DashScope와 직접 통신합니다. DashScope의 요청 데이터 처리는 Alibaba Cloud 자체 약관을 따릅니다.</p>
+
+<h2>기기에만 저장되는 데이터</h2>
+<ul>
+  <li><strong>저장한 단어, 사진 및 메타데이터</strong>는 Apple의 SwiftData를 통해 기기에 저장되며 당사로 업로드되지 않습니다.</li>
+  <li><strong>위치</strong>: 허용하신 경우에만, 앱은 단어를 저장한 <em>도시 이름</em>을 조회하기 위해서만 위치를 사용하여 학습 “발자취”를 표시합니다. 도시 이름은 단어와 함께 기기에 저장됩니다. 정확한 좌표는 당사나 AI 서비스로 전송되지 않습니다.</li>
+  <li><strong>설정</strong>(선택한 언어, 온보딩 상태)은 UserDefaults를 통해 기기에 저장됩니다.</li>
+</ul>
+
+<h2>수집하지 않는 데이터</h2>
+<ul>
+  <li>계정, 가입, 이름, 이메일, 전화번호가 필요하지 않습니다.</li>
+  <li>광고나 앱/웹사이트 간 추적이 없습니다.</li>
+  <li>분석 SDK가 없습니다.</li>
+</ul>
+
+<h2>데이터 삭제</h2>
+<p>저장한 모든 단어와 사진은 기기에 있습니다. 앱을 삭제하면 영구적으로 제거됩니다. 당사 측 서버 사본은 없습니다.</p>
+
+<h2>아동</h2>
+<p>본 앱은 일반 사용자를 위한 것이며 아동의 개인정보를 고의로 수집하지 않습니다.</p>
+
+<h2>변경</h2>
+<p>본 방침이 변경되면 이 페이지 상단의 날짜를 업데이트합니다.</p>
+
+<h2>문의</h2>
+<p>개인정보 관련 문의는 <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a> 으로 이메일 주시기 바랍니다.</p>
+</section>
+
+<hr>
+
+<!-- ======================= 日本語 ======================= -->
+<section id="ja">
+<h1>PointWord — プライバシーポリシー</h1>
+<p class="meta">最終更新日：2026年9月2日</p>
+
+<p>PointWord（「本アプリ」「当方」）は、指さし読み取り式の英語学習アプリです。現実の英単語を指でさすと、アプリが認識して語義を表示します。本ポリシーは、アプリが扱うデータとその送信先について説明します。収集するデータはごくわずかです。</p>
+
+<h2>サードパーティのAIサービスに送信するデータ</h2>
+<p>語義と短い情景説明を生成するため、アプリは暗号化（HTTPS）接続を通じて、以下をAIサービスである
+<strong>Alibaba Cloud DashScope（Model Studio）</strong>に送信します：</p>
+<ul>
+  <li><strong>単語とその前後の文</strong> — 辞書的な語義を取得するためにテキストとして送信されます。</li>
+  <li><strong>単語を保存したときに撮影した写真</strong> — 情景を一言で説明する文（例：「カフェのメニュー」）を生成するためにビジョンモデルに送信され、再会バナーと「足あと」機能に使われます。</li>
+</ul>
+<p>これらのデータは、あなたが求めた結果を生成するためだけに送信されます。<strong>あなたの身元と関連付けられることはなく</strong>、<strong>追跡にも使われず</strong>、アカウント・端末識別子・広告識別子は一切付与されません。当方は独自のサーバーを運用しておらず、アプリはDashScopeと直接通信します。DashScopeによるリクエストデータの取り扱いは、Alibaba Cloud自身の規約に従います。</p>
+
+<h2>端末内にのみ保存されるデータ</h2>
+<ul>
+  <li><strong>保存した単語・写真・メタデータ</strong>は、Appleの SwiftData を介して端末内に保存され、当方にアップロードされることはありません。</li>
+  <li><strong>位置情報</strong>：あなたの許可を得たうえで、アプリは単語を保存した<em>都市名</em>を調べるためだけに位置情報を使用し、学習の「足あと」を表示します。都市名は単語とともに端末内に保存されます。正確な座標が当方やAIサービスに送信されることはありません。</li>
+  <li><strong>設定</strong>（選択した言語、オンボーディング状態）は UserDefaults を介して端末内に保存されます。</li>
+</ul>
+
+<h2>収集しないデータ</h2>
+<ul>
+  <li>アカウント・登録・氏名・メール・電話番号は不要です。</li>
+  <li>広告や、アプリ／ウェブサイトをまたぐ追跡はありません。</li>
+  <li>分析SDKはありません。</li>
+</ul>
+
+<h2>データの削除</h2>
+<p>保存した単語と写真はすべて端末内にあります。アプリを削除すると完全に消去されます。当方側にサーバー上の複製はありません。</p>
+
+<h2>お子様について</h2>
+<p>本アプリは一般向けであり、お子様の個人情報を意図的に収集することはありません。</p>
+
+<h2>変更</h2>
+<p>本ポリシーを変更する場合は、本ページ上部の日付を更新します。</p>
+
+<h2>お問い合わせ</h2>
+<p>プライバシーに関するご質問は <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a> までメールでお問い合わせください。</p>
+</section>
+
+<hr>
+
+<!-- ======================= Français ======================= -->
+<section id="fr">
+<h1>PointWord — Politique de confidentialité</h1>
+<p class="meta">Dernière mise à jour : 2 septembre 2026</p>
+
+<p>PointWord (« l'application », « nous ») est une application d'apprentissage de l'anglais par pointage du doigt. Vous pointez un mot anglais du monde réel ; l'application le reconnaît et en affiche la définition. Cette politique explique quelles données l'application traite et où elles vont. Nous la gardons volontairement courte, car l'application collecte très peu de données.</p>
+
+<h2>Données envoyées à un service d'IA tiers</h2>
+<p>Pour générer une définition et une brève description de scène, l'application envoie les éléments suivants, via une connexion chiffrée (HTTPS), à
+<strong>Alibaba Cloud DashScope (Model Studio)</strong>, un service d'IA :</p>
+<ul>
+  <li><strong>Le mot et la phrase qui l'entoure</strong> — envoyés sous forme de texte pour obtenir la définition du dictionnaire.</li>
+  <li><strong>La photo prise lorsque vous enregistrez un mot</strong> — envoyée à un modèle de vision pour produire une description d'une ligne de la scène (par ex. « le menu d'un café »), utilisée pour la bannière de retrouvailles et la fonction « empreintes ».</li>
+</ul>
+<p>Ces données sont envoyées uniquement pour produire le résultat que vous avez demandé. Elles ne sont <strong>pas liées à votre identité</strong>, ne servent <strong>pas à vous suivre</strong>, et aucun compte, identifiant d'appareil ou identifiant publicitaire n'y est associé. Nous n'exploitons pas notre propre serveur ; l'application communique directement avec DashScope. Le traitement des données de requête par DashScope est régi par les propres conditions d'Alibaba Cloud.</p>
+
+<h2>Données qui restent sur votre appareil</h2>
+<ul>
+  <li><strong>Les mots enregistrés, les photos et les métadonnées</strong> sont stockés localement sur votre appareil (via SwiftData d'Apple). Ils ne nous sont pas envoyés.</li>
+  <li><strong>Localisation</strong> : avec votre autorisation, l'application utilise votre position uniquement pour rechercher le <em>nom de la ville</em> où vous avez enregistré un mot, afin d'afficher vos « empreintes » d'apprentissage. Le nom de la ville est stocké sur votre appareil avec le mot. Vos coordonnées précises ne nous sont pas envoyées, ni au service d'IA.</li>
+  <li><strong>Les réglages</strong> (langue choisie, état d'accueil) sont stockés sur l'appareil via UserDefaults.</li>
+</ul>
+
+<h2>Données que nous ne collectons PAS</h2>
+<ul>
+  <li>Aucun compte, inscription, nom, e-mail ou numéro de téléphone.</li>
+  <li>Aucune publicité ni suivi entre applications/sites web.</li>
+  <li>Aucun SDK d'analyse.</li>
+</ul>
+
+<h2>Suppression de vos données</h2>
+<p>Tous les mots et photos enregistrés se trouvent sur votre appareil. Supprimer l'application les efface définitivement. Il n'existe aucune copie côté serveur que nous puissions supprimer.</p>
+
+<h2>Enfants</h2>
+<p>L'application convient au grand public et ne collecte pas sciemment de données personnelles auprès d'enfants.</p>
+
+<h2>Modifications</h2>
+<p>Si cette politique change, nous mettrons à jour la date en haut de cette page.</p>
+
+<h2>Contact</h2>
+<p>Des questions sur la confidentialité ? Écrivez à <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>.</p>
+</section>
+
+<hr>
+
+<!-- ======================= Español ======================= -->
+<section id="es">
+<h1>PointWord — Política de privacidad</h1>
+<p class="meta">Última actualización: 2 de septiembre de 2026</p>
+
+<p>PointWord («la app», «nosotros») es una aplicación de aprendizaje de inglés por señalado con el dedo. Señalas con el dedo una palabra en inglés del mundo real; la app la reconoce y muestra su definición. Esta política explica qué datos maneja la app y a dónde van. La mantenemos deliberadamente breve porque la app recopila muy pocos datos.</p>
+
+<h2>Datos que enviamos a un servicio de IA de terceros</h2>
+<p>Para generar una definición y una breve descripción de la escena, la app envía lo siguiente, a través de una conexión cifrada (HTTPS), a
+<strong>Alibaba Cloud DashScope (Model Studio)</strong>, un servicio de IA:</p>
+<ul>
+  <li><strong>La palabra y la frase que la rodea</strong> — enviadas como texto para obtener la definición del diccionario.</li>
+  <li><strong>La foto tomada cuando guardas una palabra</strong> — enviada a un modelo de visión para producir una descripción de una línea de la escena (p. ej. «el menú de una cafetería»), usada para el aviso de reencuentro y la función de «huellas».</li>
+</ul>
+<p>Estos datos se envían únicamente para producir el resultado que solicitaste. <strong>No se vinculan a tu identidad</strong>, <strong>no se usan para rastrearte</strong> y no se les adjunta ninguna cuenta, identificador de dispositivo ni identificador publicitario. No operamos nuestro propio servidor; la app se comunica directamente con DashScope. El tratamiento de los datos de la solicitud por parte de DashScope se rige por los propios términos de Alibaba Cloud.</p>
+
+<h2>Datos que permanecen en tu dispositivo</h2>
+<ul>
+  <li><strong>Las palabras guardadas, las fotos y los metadatos</strong> se almacenan localmente en tu dispositivo (mediante SwiftData de Apple). No se nos suben.</li>
+  <li><strong>Ubicación</strong>: con tu permiso, la app usa tu ubicación solo para consultar el <em>nombre de la ciudad</em> donde guardaste una palabra, y así mostrar tus «huellas» de aprendizaje. El nombre de la ciudad se almacena en tu dispositivo junto con la palabra. Tus coordenadas precisas no se nos envían ni al servicio de IA.</li>
+  <li><strong>Los ajustes</strong> (idioma elegido, estado de introducción) se almacenan en el dispositivo mediante UserDefaults.</li>
+</ul>
+
+<h2>Datos que NO recopilamos</h2>
+<ul>
+  <li>Sin cuenta, registro, nombre, correo electrónico ni número de teléfono.</li>
+  <li>Sin publicidad ni seguimiento entre apps/sitios web.</li>
+  <li>Sin SDK de analítica.</li>
+</ul>
+
+<h2>Eliminar tus datos</h2>
+<p>Todas las palabras y fotos guardadas están en tu dispositivo. Eliminar la app las borra permanentemente. No hay copia en un servidor que podamos eliminar.</p>
+
+<h2>Menores</h2>
+<p>La app es apta para el público general y no recopila conscientemente información personal de menores.</p>
+
+<h2>Cambios</h2>
+<p>Si esta política cambia, actualizaremos la fecha en la parte superior de esta página.</p>
+
+<h2>Contacto</h2>
+<p>¿Preguntas sobre privacidad? Escribe a <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>.</p>
+</section>
+
+<hr>
+
+<!-- ======================= Português ======================= -->
+<section id="pt">
+<h1>PointWord — Política de Privacidade</h1>
+<p class="meta">Última atualização: 2 de setembro de 2026</p>
+
+<p>O PointWord («o app», «nós») é um aplicativo de aprendizado de inglês por apontar com o dedo. Você aponta o dedo para uma palavra em inglês no mundo real; o app a reconhece e mostra a definição. Esta política explica quais dados o app processa e para onde eles vão. Nós a mantemos deliberadamente curta porque o app coleta muito poucos dados.</p>
+
+<h2>Dados que enviamos a um serviço de IA de terceiros</h2>
+<p>Para gerar uma definição e uma breve descrição da cena, o app envia o seguinte, por meio de uma conexão criptografada (HTTPS), ao
+<strong>Alibaba Cloud DashScope (Model Studio)</strong>, um serviço de IA:</p>
+<ul>
+  <li><strong>A palavra e a frase ao seu redor</strong> — enviadas como texto para obter a definição do dicionário.</li>
+  <li><strong>A foto capturada quando você salva uma palavra</strong> — enviada a um modelo de visão para produzir uma descrição de uma linha da cena (por ex., «o cardápio de um café»), usada no aviso de reencontro e no recurso de «pegadas».</li>
+</ul>
+<p>Esses dados são enviados apenas para produzir o resultado que você pediu. <strong>Não são vinculados à sua identidade</strong>, <strong>não são usados para rastreá-lo</strong> e nenhuma conta, identificador de dispositivo ou identificador de publicidade é anexado a eles. Não operamos nosso próprio servidor; o app se comunica diretamente com o DashScope. O tratamento dos dados da solicitação pelo DashScope é regido pelos próprios termos da Alibaba Cloud.</p>
+
+<h2>Dados que permanecem no seu dispositivo</h2>
+<ul>
+  <li><strong>As palavras salvas, fotos e metadados</strong> são armazenados localmente no seu dispositivo (via SwiftData da Apple). Eles não são enviados a nós.</li>
+  <li><strong>Localização</strong>: com a sua permissão, o app usa a sua localização apenas para consultar o <em>nome da cidade</em> onde você salvou uma palavra, para mostrar suas «pegadas» de aprendizado. O nome da cidade é armazenado no seu dispositivo junto com a palavra. Suas coordenadas precisas não são enviadas a nós nem ao serviço de IA.</li>
+  <li><strong>As configurações</strong> (idioma escolhido, estado de introdução) são armazenadas no dispositivo via UserDefaults.</li>
+</ul>
+
+<h2>Dados que NÃO coletamos</h2>
+<ul>
+  <li>Sem conta, cadastro, nome, e-mail ou número de telefone.</li>
+  <li>Sem publicidade nem rastreamento entre apps/sites.</li>
+  <li>Sem SDKs de análise.</li>
+</ul>
+
+<h2>Excluir seus dados</h2>
+<p>Todas as palavras e fotos salvas estão no seu dispositivo. Excluir o app as remove permanentemente. Não há cópia no servidor para excluirmos.</p>
+
+<h2>Crianças</h2>
+<p>O app é adequado para o público geral e não coleta intencionalmente informações pessoais de crianças.</p>
+
+<h2>Alterações</h2>
+<p>Se esta política mudar, atualizaremos a data no topo desta página.</p>
+
+<h2>Contato</h2>
+<p>Dúvidas sobre privacidade? Escreva para <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>.</p>
+</section>
+
+<hr>
+
+<!-- ======================= Italiano ======================= -->
+<section id="it">
+<h1>PointWord — Informativa sulla privacy</h1>
+<p class="meta">Ultimo aggiornamento: 2 settembre 2026</p>
+
+<p>PointWord («l'app», «noi») è un'app per imparare l'inglese puntando il dito. Punti il dito su una parola inglese nel mondo reale; l'app la riconosce e ne mostra la definizione. Questa informativa spiega quali dati l'app tratta e dove vanno. La manteniamo volutamente breve perché l'app raccoglie pochissimi dati.</p>
+
+<h2>Dati che inviamo a un servizio di IA di terze parti</h2>
+<p>Per generare una definizione e una breve descrizione della scena, l'app invia quanto segue, tramite una connessione cifrata (HTTPS), ad
+<strong>Alibaba Cloud DashScope (Model Studio)</strong>, un servizio di IA:</p>
+<ul>
+  <li><strong>La parola e la frase circostante</strong> — inviate come testo per ottenere la definizione del dizionario.</li>
+  <li><strong>La foto scattata quando salvi una parola</strong> — inviata a un modello di visione per produrre una descrizione di una riga della scena (es. «il menù di un caffè»), usata per il banner del ritrovamento e la funzione «impronte».</li>
+</ul>
+<p>Questi dati vengono inviati esclusivamente per produrre il risultato che hai richiesto. <strong>Non sono collegati alla tua identità</strong>, <strong>non vengono usati per tracciarti</strong> e non vi viene associato alcun account, identificatore del dispositivo o identificatore pubblicitario. Non gestiamo un nostro server; l'app comunica direttamente con DashScope. Il trattamento dei dati della richiesta da parte di DashScope è regolato dai termini di Alibaba Cloud.</p>
+
+<h2>Dati che restano sul tuo dispositivo</h2>
+<ul>
+  <li><strong>Le parole salvate, le foto e i metadati</strong> sono memorizzati localmente sul tuo dispositivo (tramite SwiftData di Apple). Non ci vengono caricati.</li>
+  <li><strong>Posizione</strong>: con il tuo permesso, l'app usa la tua posizione solo per cercare il <em>nome della città</em> in cui hai salvato una parola, così da mostrare le tue «impronte» di apprendimento. Il nome della città è memorizzato sul tuo dispositivo insieme alla parola. Le tue coordinate precise non vengono inviate a noi né al servizio di IA.</li>
+  <li><strong>Le impostazioni</strong> (lingua scelta, stato di introduzione) sono memorizzate sul dispositivo tramite UserDefaults.</li>
+</ul>
+
+<h2>Dati che NON raccogliamo</h2>
+<ul>
+  <li>Nessun account, registrazione, nome, e-mail o numero di telefono.</li>
+  <li>Nessuna pubblicità né tracciamento tra app/siti web.</li>
+  <li>Nessun SDK di analisi.</li>
+</ul>
+
+<h2>Eliminazione dei tuoi dati</h2>
+<p>Tutte le parole e le foto salvate si trovano sul tuo dispositivo. Eliminando l'app vengono rimosse definitivamente. Non esiste una copia lato server che possiamo eliminare.</p>
+
+<h2>Minori</h2>
+<p>L'app è adatta a un pubblico generico e non raccoglie consapevolmente informazioni personali dai minori.</p>
+
+<h2>Modifiche</h2>
+<p>Se questa informativa cambia, aggiorneremo la data in cima a questa pagina.</p>
+
+<h2>Contatti</h2>
+<p>Domande sulla privacy? Scrivi a <a href="mailto:cooler09@foxmail.com">cooler09@foxmail.com</a>.</p>
+</section>
 
 </body>
 </html>

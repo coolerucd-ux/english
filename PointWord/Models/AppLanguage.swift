@@ -650,10 +650,23 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         }
     }
 
-    // The hosted policy (GitHub Pages). Region-agnostic — the same page serves both
-    // the English and Chinese sections, matching what's filed in App Store Connect.
+    // The hosted policy (GitHub Pages). One page holds all 8 languages as stacked
+    // sections; the per-language anchor deep-links straight to the reader's own
+    // section so they never land on a language they can't read. English is first,
+    // then the eight supported languages in picker order.
     var privacyPolicyURL: URL {
-        URL(string: "https://coolerucd-ux.github.io/english/privacy.html")!
+        let anchor: String
+        switch self {
+        case .zhHans: anchor = "zh-hans"
+        case .zhHant: anchor = "zh-hant"
+        case .ko:     anchor = "ko"
+        case .ja:     anchor = "ja"
+        case .fr:     anchor = "fr"
+        case .es:     anchor = "es"
+        case .pt:     anchor = "pt"
+        case .it:     anchor = "it"
+        }
+        return URL(string: "https://coolerucd-ux.github.io/english/privacy.html#\(anchor)")!
     }
 }
 
