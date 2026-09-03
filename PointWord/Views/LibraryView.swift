@@ -48,11 +48,11 @@ struct LibraryView: View {
                     Button {
                         dismiss()
                     } label: {
-                        // Lucide chevron-left (was the SF Symbol chevron.left). All
-                        // header chrome icons — back, globe, close — are the SAME
-                        // Lucide set: stroke-width 2, drawn at 28×28, so their line
-                        // weight and size read identically. An SF Symbol here used a
-                        // different stroke model and never matched.
+                        // Lucide chevron-left (was the SF Symbol chevron.left). Every
+                        // icon in the app is the SAME Lucide set: stroke-width 1.6,
+                        // drawn at 28×28 here, so their line weight and size read
+                        // identically. An SF Symbol here used a different stroke model
+                        // and never matched.
                         Image("IconChevronLeft")
                             .renderingMode(.template)
                             .resizable()
@@ -64,9 +64,9 @@ struct LibraryView: View {
                     Button {
                         showLanguagePicker = true
                     } label: {
-                        // Lucide globe asset, 28×28 — matches the back chevron so
+                        // Lucide ellipsis asset, 28×28 — matches the back chevron so
                         // both header glyphs read as one set.
-                        Image("IconGlobe")
+                        Image("IconEllipsis")
                             .renderingMode(.template)
                             .resizable()
                             .scaledToFit()
@@ -85,8 +85,12 @@ struct LibraryView: View {
                     bottomTabBar
                 }
             }
-            .sheet(isPresented: $showLanguagePicker) {
-                languagePicker
+            // "More" is a PUSHED page (not a sheet): tapping the ellipsis navigates
+            // into a full settings screen carrying the explanation-language list and
+            // the privacy link, with a native back chevron. Driven off the same
+            // showLanguagePicker flag via navigationDestination.
+            .navigationDestination(isPresented: $showLanguagePicker) {
+                settingsPage
             }
             // Detail slides up from the bottom instead of pushing in. Full-height
             // so the letterboxed page + floating card have the same room they had
@@ -199,50 +203,74 @@ struct LibraryView: View {
         language.collectionCount(savedWords.count)
     }
 
-    // MARK: - Language picker
+    // MARK: - More / settings page
 
-    private var languagePicker: some View {
-        NavigationStack {
-            List {
-                Section {
-                    ForEach(AppLanguage.allCases) { lang in
-                        Button {
-                            languageRaw = lang.rawValue
-                            showLanguagePicker = false
-                        } label: {
-                            HStack {
-                                Text(lang.displayName)
-                                    .foregroundColor(.primary)
-                                Spacer()
-                                if lang == language {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(.yellow)
-                                }
+    // The "More" settings PAGE (pushed, not a sheet). Renders inside the parent
+    // NavigationStack, so it gets the native back chevron automatically — no inner
+    // NavigationStack or presentationDetents here. Carries the explanation-language
+    // picker, an App Store rating link, and the in-app privacy link.
+    private var settingsPage: some View {
+        List {
+            // First card: explanation-language switcher, under its own header.
+            // Picking a language DOES NOT pop back — the user reviews their choice
+            // (the checkmark moves) and leaves via the back chevron themselves.
+            Section(header: Text(language.switchLanguageSection)) {
+                ForEach(AppLanguage.allCases) { lang in
+                    Button {
+                        languageRaw = lang.rawValue
+                    } label: {
+                        HStack(spacing: 12) {
+                            // Country/region flag — the one bit of color in the list,
+                            // fixed at 24pt to match the rate/privacy glyphs below.
+                            Text(lang.flag)
+                                .font(.system(size: 24))
+                            Text(lang.displayName)
+                                .foregroundColor(.primary)
+                            Spacer()
+                            if lang == language {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.yellow)
                             }
                         }
                     }
                 }
-                // In-app privacy-policy link. Apple 5.1.1(i) requires the policy to be
-                // reachable INSIDE the app (camera + location = data collection), not
-                // only in App Store metadata. Tucked in the sheet footer so it meets
-                // the rule without intruding on the main flow.
-                Section {
-                    Link(destination: language.privacyPolicyURL) {
-                        HStack {
-                            Text(language.privacyPolicy)
-                                .foregroundColor(.primary)
-                            Spacer()
-                            Image(systemName: "arrow.up.right")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
+            }
+            // Rate on the App Store — opens the review sheet in the user's own
+            // storefront (region auto-detected, see AppLanguage.reviewURL).
+            Section {
+                Link(destination: AppLanguage.reviewURL) {
+                    HStack(spacing: 12) {
+                        Image("IconMessageHeart")
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 24, height: 24)
+                            .foregroundStyle(.white)
+                        Text(language.rateApp)
+                            .foregroundColor(.primary)
                     }
                 }
             }
-            .navigationTitle(language.languageTitle)
-            .navigationBarTitleDisplayMode(.inline)
+            // In-app privacy-policy link. Apple 5.1.1(i) requires the policy to be
+            // reachable INSIDE the app (camera + location = data collection), not
+            // only in App Store metadata.
+            Section {
+                Link(destination: language.privacyPolicyURL) {
+                    HStack(spacing: 12) {
+                        Image("IconShieldCheck")
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 24, height: 24)
+                            .foregroundStyle(.white)
+                        Text(language.privacyPolicy)
+                            .foregroundColor(.primary)
+                    }
+                }
+            }
         }
-        .presentationDetents([.medium, .large])
+        .navigationTitle(language.moreTitle)
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     private var emptyState: some View {

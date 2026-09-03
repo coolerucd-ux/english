@@ -28,6 +28,24 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         }
     }
 
+    // Flag emoji shown before each language row in the picker. A language isn't a
+    // country, so each is the most representative region: Traditional Chinese maps
+    // to Hong Kong 🇭🇰 (it also covers TW/MO) rather than picking one politically
+    // loaded storefront. These are the one bit of color in an otherwise monochrome
+    // list — deliberate, since flags read instantly.
+    var flag: String {
+        switch self {
+        case .zhHant: return "🇭🇰"
+        case .zhHans: return "🇨🇳"
+        case .ko:     return "🇰🇷"
+        case .ja:     return "🇯🇵"
+        case .fr:     return "🇫🇷"
+        case .es:     return "🇪🇸"
+        case .pt:     return "🇵🇹"
+        case .it:     return "🇮🇹"
+        }
+    }
+
     // How we tell the model which language to answer in.
     var promptName: String {
         switch self {
@@ -203,6 +221,48 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .es:     return "Idioma de explicación"
         case .pt:     return "Idioma da explicação"
         case .it:     return "Lingua di spiegazione"
+        }
+    }
+
+    // Title of the pushed "More" page (was the language sheet).
+    var moreTitle: String {
+        switch self {
+        case .zhHant: return "更多"
+        case .zhHans: return "更多"
+        case .ko:     return "더 보기"
+        case .ja:     return "その他"
+        case .fr:     return "Plus"
+        case .es:     return "Más"
+        case .pt:     return "Mais"
+        case .it:     return "Altro"
+        }
+    }
+
+    // Header above the explanation-language list, inside the More page.
+    var switchLanguageSection: String {
+        switch self {
+        case .zhHant: return "切換解釋語言"
+        case .zhHans: return "切换解释语言"
+        case .ko:     return "설명 언어 변경"
+        case .ja:     return "説明の言語を切り替え"
+        case .fr:     return "Changer la langue d'explication"
+        case .es:     return "Cambiar idioma de explicación"
+        case .pt:     return "Alterar idioma da explicação"
+        case .it:     return "Cambia lingua di spiegazione"
+        }
+    }
+
+    // "Rate us" row — deep-links to the App Store review sheet.
+    var rateApp: String {
+        switch self {
+        case .zhHant: return "給我們評價"
+        case .zhHans: return "给我们评价"
+        case .ko:     return "평가 남기기"
+        case .ja:     return "評価する"
+        case .fr:     return "Donnez votre avis"
+        case .es:     return "Déjanos tu opinión"
+        case .pt:     return "Avalie-nos"
+        case .it:     return "Lascia una recensione"
         }
     }
 
@@ -667,6 +727,21 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .it:     anchor = "it"
         }
         return URL(string: "https://coolerucd-ux.github.io/english/privacy.html#\(anchor)")!
+    }
+
+    // The App's numeric App Store ID (the "Apple ID" shown in App Store Connect →
+    // App Information → General Information — NOT the bundle ID). Needed to build
+    // the review deep link.
+    static let appStoreID = "6807819338"
+
+    // Deep link to the App Store review sheet. Region-independent ON PURPOSE: the
+    // URL carries NO country code, so the App Store opens in whatever storefront the
+    // user's Apple account belongs to — hardcoding /us/ or /cn/ would trap everyone
+    // in one region. Uses the itms-apps scheme so it jumps straight into the App
+    // Store app (with an https fallback below for safety).
+    static var reviewURL: URL {
+        URL(string: "itms-apps://apps.apple.com/app/id\(appStoreID)?action=write-review")
+            ?? URL(string: "https://apps.apple.com/app/id\(appStoreID)?action=write-review")!
     }
 }
 

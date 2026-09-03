@@ -46,6 +46,11 @@ struct CameraView: View {
     @State private var recallItem: SavedWord? = nil
     // Words whose answer is still streaming in — drives the typing cursor.
     @State private var streamingWords: Set<String> = []
+    // Debounces the hover prefetch: a finger sweeping toward its target crosses
+    // several words, and firing a full qwen-plus request for each one is the main
+    // source of "reflexive" repeat calls. Only the word the finger SETTLES on
+    // (stable for the debounce window) is prefetched. Recognition never reads this.
+    @State private var prefetchTask: Task<Void, Never>? = nil
     // Last query issued per display key — lets a failed card retry with the same params.
     @State private var queryUnits: [String: QueryUnit] = [:]
 
@@ -88,6 +93,13 @@ struct CameraView: View {
     // needs a self-diagnosing screenshot again.
     private let showDiagnostics = false
 
+    // mm:ss clock for the diagnostic HUD's live "now@" readout (see the HUD block).
+    private static let hudClock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "mm:ss"
+        return f
+    }()
+
     // NOTE — the OTHER half of the freeze fix: this view holds NO cached screen
     // geometry and reads NO global mutable state (UIScreen.main / UIApplication.shared)
     // anywhere in its body. Those reads-during-body were the AttributeGraph cycle
@@ -127,12 +139,19 @@ struct CameraView: View {
             if showDiagnostics && !camera.diagLine.isEmpty {
                 VStack {
                     HStack {
-                        Text(camera.diagLine)
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.black.opacity(0.55), in: Capsule())
+                        // diagLine carries the LAST frame's time (frame@mm:ss); the
+                        // TimelineView clock ticks live every second. If the two drift
+                        // apart in a screenshot, frame delivery has stopped — the
+                        // decisive test for "完全静止一帧不动" (dead pipeline) vs a
+                        // stale still covering a live preview (UI bug).
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text("\(camera.diagLine) now@\(Self.hudClock.string(from: ctx.date))")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.black.opacity(0.55), in: Capsule())
+                        }
                         Spacer()
                     }
                     Spacer()
@@ -509,6 +528,11 @@ struct CameraView: View {
         reunionBanner = nil
         recallItem = nil
         camera.unfreeze()       // drop the still, resume live preview
+        camera.restartIfStopped() // self-heal: if another camera app interrupted us
+                                  // while this card sat locked, the session may be
+                                  // stopped and the interruptionEnded notice may never
+                                  // have come — re-arm so 重新识别 shows a LIVE preview
+                                  // (scan light + green dot) instead of a dead one.
         camera.resetDetection() // clear stale pointed word so the next card comes
                                 // from a FRESH finger hold, not the leftover result
                                 // that just closed
@@ -694,16 +718,32 @@ struct CameraView: View {
 
     // MARK: - AI Lookup
 
-    // Fire the lookup while the finger is still hovering (before the 0.4s
+    // Fire the lookup while the finger is still hovering (before the 0.65s
     // confirm). By the time the card opens the result is usually already cached,
     // so it appears instantly instead of after a spinner.
+    //
+    // DEBOUNCED so a finger sweeping toward its target doesn't fire a full request
+    // for every word it crosses. hoveringWord changes each time the finger settles
+    // on a new spot (CameraManager restarts the dwell); we wait 0.25s of stability
+    // before prefetching, so only the word actually being read is queried. The
+    // window is well under hoverDuration (0.65s), so the settled word is always
+    // prefetched BEFORE it can lock — the instant-card behaviour is preserved.
+    // Cache and in-flight (streamingWords) checks then drop any redundant call.
     private func prefetchHovered() {
+        prefetchTask?.cancel()
         guard !isLocked, let w = camera.hoveringWord, !w.text.isEmpty else { return }
         // Clean identically to targetWord() so the prefetch caches under the SAME
         // key the locked card will read — otherwise "domain," and "domain" would
         // miss each other's cache and refetch.
         let clean = w.text.cleanedWord.isEmpty ? w.text : w.text.cleanedWord
-        lookup(QueryUnit(displayKey: clean, term: clean, context: w.context))
+        let context = w.context
+        prefetchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)   // 0.25s settle window
+            guard !Task.isCancelled, !isLocked else { return }
+            // Already answered or a request for it is in flight — nothing to do.
+            if cardStates[clean] != nil || streamingWords.contains(clean) { return }
+            lookup(QueryUnit(displayKey: clean, term: clean, context: context))
+        }
     }
 
     private func lookup(_ unit: QueryUnit) {

@@ -186,9 +186,23 @@ final class CameraManager: NSObject {
     @ObservationIgnored private var dwellLastTick: Date? = nil
     @ObservationIgnored private var dwellAnchor: CGPoint? = nil     // where the dwell is centered
     @ObservationIgnored private var dwellWord: String? = nil       // best-known label at the anchor
+    // The committed word's OCR box. Lets us tell an OCR text flicker at the SAME
+    // physical word (box unchanged) from the finger actually landing on a DIFFERENT
+    // neighbour word (a distinct box) — the two are indistinguishable by the loose
+    // 0.045 anchor radius alone on dense text at low fps.
+    @ObservationIgnored private var dwellBox: CGRect? = nil
+    // Confirmation for switching to a DIFFERENT word while the probe is still within the
+    // (coarse) anchor radius. A 1-frame jitter onto a neighbour must NOT switch (that was
+    // "指左识别右"); a genuine settle on an adjacent word must (that was "划过A停B得A").
+    // We require the new word to be the candidate for switchConfirmFrames CONSECUTIVE
+    // frames — frame-count based so it holds up at the 4–5 fps of dense pages, where a
+    // time window would be satisfied by a single jitter frame.
+    @ObservationIgnored private var switchCandidateText: String? = nil
+    @ObservationIgnored private var switchCandidateCount = 0
+    private let switchConfirmFrames = 2
     @ObservationIgnored private var candidateLostSince: Date? = nil // OCR briefly lost the word
     @ObservationIgnored private var fingerLostSince: Date? = nil    // hand pose briefly dropped
-    private let hoverDuration: TimeInterval = 0.65  // cumulative STILL-frame time before confirming
+    private let hoverDuration: TimeInterval = 0.45  // cumulative STILL-frame time before confirming
     private let dwellAnchorTolerance: CGFloat = 0.045 // probe within this of the anchor = same target
     private let candidateLostGrace: TimeInterval = 0.6 // hold the dwell through OCR dropouts
     private let fingerLostGrace: TimeInterval = 0.4    // hold the dwell through hand-pose dropouts
@@ -214,6 +228,13 @@ final class CameraManager: NSObject {
     @ObservationIgnored private var diagLastLog: Date = .distantPast
     @ObservationIgnored private var diagFrameCount = 0
     private let diagLogInterval: TimeInterval = 1.0
+    // mm:ss formatter for the HUD frame timestamp — lets a screenshot show whether
+    // frame delivery is still advancing (compared against the HUD's live clock).
+    private static let hudTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "mm:ss"
+        return f
+    }()
 
     // Finger entry mute (processing-queue only) — ignore the first fingerEntryMute
     // after a hand appears, so a hand merely sweeping into frame can't instantly
@@ -354,6 +375,9 @@ final class CameraManager: NSObject {
         dwellLastTick = nil
         dwellAnchor = nil
         dwellWord = nil
+        dwellBox = nil
+        switchCandidateText = nil
+        switchCandidateCount = 0
         candidateLostSince = nil
         fingerLostSince = nil
         pointingProgress = 0
@@ -488,9 +512,20 @@ final class CameraManager: NSObject {
     }
 
     @objc private func sessionInterruptionEnded(_ note: Notification) {
-        // The interruption cleared; AVCaptureSession auto-resumes if it was running.
-        // No forced restart on top of the system's own resume.
-        print("🟢 相机中断结束 — 系统自动恢复帧流")
+        // The interruption cleared. In THEORY AVCaptureSession auto-resumes — but when
+        // the interruption was another camera client (e.g. the system Camera app grabbed
+        // the device while we sat frozen on a locked card), iOS often leaves our session
+        // stopped: isRunning went false during the interruption, so there's nothing for
+        // it to "resume". The result was a dead preview on 重新识别 (no scan light / no
+        // green dot) until the user bounced through the library. Re-arming HERE, exactly
+        // when the system reports the interruption is over, is not fighting the system —
+        // it's completing the resume the system didn't. Idempotent + foreground-guarded,
+        // so it no-ops when the session is already live.
+        print("🟢 相机中断结束 — 确认帧流，必要时重新拉起")
+        sessionQueue.async { [weak self] in
+            guard let self, self.isForeground() else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+        }
     }
 
     // MARK: - Lifecycle
@@ -561,6 +596,24 @@ final class CameraManager: NSObject {
             // trap, so re-check here.
             guard self.isForeground() else { return }
             if !self.session.isRunning { self.session.startRunning() }
+        }
+    }
+
+    // Re-arm the session ONLY if it has stopped — the user-initiated self-heal for
+    // 重新识别. If another camera client interrupted us while a card sat locked and the
+    // interruptionEnded notification never arrived (it's not guaranteed), the preview
+    // stays dead until something restarts the session. Calling this from dismiss() lets
+    // the user's own "重新识别" tap recover the camera instead of forcing a trip through
+    // the library. Idempotent: when the session is already live this costs one queue hop
+    // and does nothing, so it never re-hammers a healthy server.
+    func restartIfStopped() {
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
+        sessionQueue.async { [weak self] in
+            guard let self, self.isForeground() else { return }
+            if !self.session.isRunning {
+                self.ensureConfigured()
+                self.session.startRunning()
+            }
         }
     }
 
@@ -750,9 +803,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             let running = session.isRunning
             let hasFinger = finger != nil
             let wc = words.count
+            // Embed the frame's wall-clock time (mm:ss). The HUD shows a live-ticking
+            // clock beside it; if this frame time freezes while the live clock advances,
+            // frame DELIVERY has stopped (captureOutput isn't running) — the decisive
+            // "完全静止一帧不动" signal, readable from a single screenshot.
+            let stamp = Self.hudTimeFormatter.string(from: dnow)
             DispatchQueue.main.async { [weak self] in
-                self?.diagLine = String(format: "fps=%.0f w=%d f=%@ run=%@",
-                                        fps, wc, hasFinger ? "Y" : "N", running ? "Y" : "N")
+                self?.diagLine = String(format: "fps=%.0f w=%d f=%@ run=%@ frame@%@",
+                                        fps, wc, hasFinger ? "Y" : "N", running ? "Y" : "N", stamp)
             }
             diagLastLog = dnow
             diagFrameCount = 0
@@ -1090,25 +1148,74 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         candidateLostSince = nil
 
-        // Same target is POSITION-based: the probe is still within tolerance of the
-        // anchor. OCR text flicker at that spot (e.g. "the"↔"thc" between frames) must
-        // NOT reset the dwell — resetting on flicker was the reported "反复放大". So we
-        // stay in the accrue branch whenever on-anchor, and keep the anchor's ORIGINAL
-        // label stable rather than flip-flopping it with every OCR wobble.
-        if onAnchor || dwellWord == nil {
+        // ── Decide: same word (accrue), or a real move to a different word (switch)? ──
+        //
+        // The tension: OCR text/box jitter at the SAME physical spot must NOT reset the
+        // dwell ("反复放大"), yet the finger genuinely landing on a NEIGHBOUR must switch
+        // ("划过A停B得A"), and a single jitter frame onto a neighbour must NOT switch
+        // ("指左识别右"). The 0.045 anchor radius alone can't separate these on dense text.
+        //
+        // Three cases:
+        //   1. Candidate is the SAME committed word (same label, OR its box overlaps the
+        //      committed box — an OCR relabel of the same physical word). Accrue. This is
+        //      the anti-shake path: never resets progress.
+        //   2. Candidate is a DIFFERENT word AND the probe has left the anchor radius —
+        //      an unambiguous move. Switch immediately (original responsiveness).
+        //   3. Candidate is a DIFFERENT word but still within the anchor radius — the
+        //      ambiguous neighbour case. Require switchConfirmFrames CONSECUTIVE frames of
+        //      the same new word before switching. A 1-frame jitter never survives this;
+        //      a finger truly parked on the neighbour does.
+        let sameWord: Bool
+        if candidate.text == dwellWord {
+            sameWord = true
+        } else if let db = dwellBox {
+            let cb = candidate.boundingBox
+            sameWord = db.contains(CGPoint(x: cb.midX, y: cb.midY))
+                    || cb.contains(CGPoint(x: db.midX, y: db.midY))
+        } else {
+            sameWord = false
+        }
+
+        // Should we switch to this different candidate? Off-anchor → yes now. On-anchor →
+        // only after it persists for switchConfirmFrames consecutive frames.
+        var confirmedSwitch = false
+        if !sameWord, dwellWord != nil {
+            if !onAnchor {
+                confirmedSwitch = true
+            } else {
+                if switchCandidateText == candidate.text {
+                    switchCandidateCount += 1
+                } else {
+                    switchCandidateText = candidate.text
+                    switchCandidateCount = 1
+                }
+                confirmedSwitch = switchCandidateCount >= switchConfirmFrames
+            }
+        }
+        // Any frame that isn't building toward a switch clears the streak, so only
+        // CONSECUTIVE sightings of one neighbour count.
+        if sameWord || confirmedSwitch {
+            switchCandidateText = nil
+            switchCandidateCount = 0
+        }
+
+        if (sameWord && (onAnchor || dwellWord == nil)) || dwellWord == nil {
             // First commit on this target: plant the anchor here so the dot pins from
             // frame one and progress starts accruing immediately (no throwaway frame).
             if dwellWord == nil {
                 dwellWord = candidate.text
                 dwellAnchor = probe
+                dwellBox = candidate.boundingBox
                 fingerProbePoint = probe
             }
             // Track the freshest candidate for the card/prefetch context, but only when
             // it matches the committed label — a flicker to a different string is
-            // ignored so the dot's target stays put.
+            // ignored so the dot's target stays put. Refresh dwellBox to the live box so
+            // the flicker/neighbour test tracks the word as OCR jitters it frame to frame.
             if hoveringWord?.text != candidate.text, candidate.text == dwellWord {
                 hoveringText = candidate.text
                 hoveringWord = candidate
+                dwellBox = candidate.boundingBox
             } else if hoveringWord == nil {
                 hoveringText = dwellWord
                 hoveringWord = candidate
@@ -1136,18 +1243,39 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             if dwellProgress >= 1, pointedWord?.text != locked.text {
                 pointedWord = locked
             }
-        } else {
+        } else if confirmedSwitch {
             // Finger genuinely moved to a DIFFERENT word / spot — restart the dwell.
             dwellAnchor = probe
             dwellWord = candidate.text
+            dwellBox = candidate.boundingBox
             dwellProgress = 0
             dwellLastTick = now
             candidateLostSince = nil
             fingerLostSince = nil
+            switchCandidateText = nil
+            switchCandidateCount = 0
             hoveringText = candidate.text
             hoveringWord = candidate
             pointedWord = nil
             setPointingProgress(0)
+        } else {
+            // A DIFFERENT word appeared within the anchor radius but hasn't been confirmed
+            // for enough consecutive frames yet — treat as jitter: hold the committed
+            // word, keep accruing (pause only if the finger is moving), don't switch. This
+            // is what stops a 1-frame neighbour flicker from becoming "指左识别右".
+            if !withinEntryMute && still {
+                let last = dwellLastTick ?? now
+                let dt = min(max(now.timeIntervalSince(last), 0), dwellDtClamp)
+                dwellProgress = min(1, dwellProgress + dt / hoverDuration)
+                dwellLastTick = now
+            } else {
+                dwellLastTick = nil
+            }
+            setPointingProgress(dwellProgress)
+            let locked = hoveringWord ?? candidate
+            if dwellProgress >= 1, let hw = hoveringWord, pointedWord?.text != hw.text {
+                pointedWord = locked
+            }
         }
     }
 
@@ -1164,6 +1292,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         dwellLastTick = nil
         dwellAnchor = nil
         dwellWord = nil
+        dwellBox = nil
+        switchCandidateText = nil
+        switchCandidateCount = 0
         candidateLostSince = nil
         fingerLostSince = nil
         pointedWord = nil
